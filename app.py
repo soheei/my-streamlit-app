@@ -42,10 +42,10 @@ if st.button("     "):
             # GPT 호출
             response = client.responses.create(
                 model="gpt-4o-mini",
-                input=[
-                    {"role": "system", "content":    },
-                    {"role": "user", "content":    }
-                ]
+                   input=[
+                        {"role": "system", "content": "당신은 친절한 AI 비서입니다."},
+                         {"role": "user", "content": "파이썬이 무엇인지 쉽게 설명해줘."}
+                         ]
             )
 
             # 결과 출력
