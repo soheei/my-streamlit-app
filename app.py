@@ -8,7 +8,7 @@ client = OpenAI()
 
 # 페이지 설정
 st.set_page_config(page_title="간단한 챗봇", page_icon="🤖")
-st.title("🤖 단순 챗봇")
+st.title("🤖 단순 하지만 멋진 챗봇")
 st.write("대화를 기억하지 않는 단순 챗봇입니다.")
 
 # 사용자 질문
