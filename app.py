@@ -430,7 +430,7 @@ with st.sidebar:
 # ---------------------------------------------------------------
 head_left, head_right = st.columns([3, 2])
 with head_left:
-    st.title("##🤖 AI 개인비서 에이블")
+    st.markdown("## 🤖 AI 개인비서 에이블")
 with head_right:
     st.write("")
     badges = []
