@@ -99,6 +99,7 @@ def build_instructions(meeting_text, recipient):
 이메일 본문에는 요청받은 내용을 정리해 넣으세요.
 send_email은 바로 발송하지 않고 사용자가 화면에서 확인하는 초안을 만듭니다.
 도구 결과의 status가 pending_user_confirmation이면 "이메일 초안을 만들었으니 화면에서 내용을 확인하고 발송해 주세요"라고 안내하고, 발송됐다고 말하지 마세요.
+사용자가 발송해줘 라고 요청하면 그제서야 이메일을 발송합니다.
 """
     if recipient:
         role += f"\n사용자가 따로 말하지 않으면 이메일 수신자는 {recipient} 입니다.\n"
