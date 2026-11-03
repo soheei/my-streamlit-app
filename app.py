@@ -17,15 +17,7 @@ from openai import OpenAI
 # 페이지 설정
 # ---------------------------------------------------------------
 st.set_page_config(page_title="AI 개인비서 에이블", page_icon="🤖", layout="wide")
-# 상단 여백 줄이기
-st.markdown(
-    """
-    <style>
-    .block-container { padding-top: 1rem; padding-bottom: 1rem; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+
 ROBOT_URL = "https://raw.githubusercontent.com/Jangrae/img/master/ai_robot.png"
 USER_AVATAR = "🧑‍💼"
 CHAT_HEIGHT = 400      # 대화 영역 높이(px)
