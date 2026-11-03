@@ -181,6 +181,8 @@ if "mail_log" not in st.session_state:
     st.session_state.mail_log = []
 if "last_audio" not in st.session_state:
     st.session_state.last_audio = None
+if "last_answer" not in st.session_state:
+    st.session_state.last_answer = ""
 if "email_draft" not in st.session_state:
     st.session_state.email_draft = None   # 발송 전 확인 대기 중인 이메일 초안
 if "draft_id" not in st.session_state:
@@ -222,6 +224,7 @@ with st.sidebar:
     if st.button("🗑️ 대화 초기화"):
         st.session_state.history = []
         st.session_state.last_audio = None
+        st.session_state.last_answer = ""
         st.session_state.mail_log = []
         st.session_state.email_draft = None
         st.session_state.recorder_key += 1
@@ -282,8 +285,21 @@ if queued or run_clicked:
                     user_text = transcribe(audio_file)
                 st.info(f"🗣️ 인식된 요청: {user_text}")
 
+                draft_before = st.session_state.draft_id
                 answer = ask_able(user_text, meeting_text, recipient)
-                st.session_state.last_audio = synthesize(answer)
+
+                # 새 이메일 초안이 만들어졌으면 초안 내용도 음성으로 함께 읽어 줌
+                speech_text = answer
+                new_draft = st.session_state.email_draft
+                if new_draft and st.session_state.draft_id != draft_before:
+                    speech_text += (
+                        f"\n이메일 초안을 읽어 드리겠습니다. "
+                        f"받는 사람은 {new_draft['to']}, 제목은 {new_draft['subject']}입니다. "
+                        f"본문입니다. {new_draft['body']}"
+                    )
+
+                st.session_state.last_audio = synthesize(speech_text)
+                st.session_state.last_answer = answer
                 just_generated = True
 
             # 대화 히스토리 저장 (최근 MAX_HISTORY개만 유지)
@@ -299,8 +315,11 @@ if queued or run_clicked:
 # 음성 응답 재생 (새로 만든 응답만 자동 재생)
 # ---------------------------------------------------------------
 if st.session_state.last_audio:
-    st.markdown("##### 🔊 에이블의 음성 답변")
+    st.markdown("##### 🔊 에이블의 답변")
     st.audio(st.session_state.last_audio, format="audio/mp3", autoplay=just_generated)
+    if show_text and st.session_state.last_answer:
+        with st.chat_message("assistant"):
+            st.markdown(st.session_state.last_answer)
 
 # ---------------------------------------------------------------
 # 이메일 발송 전 확인 (사용자가 수정 후 발송 / 취소)
@@ -334,10 +353,11 @@ if st.session_state.mail_log:
 # ---------------------------------------------------------------
 # 대화 기록
 # ---------------------------------------------------------------
-if st.session_state.history:
+previous = st.session_state.history[:-2]  # 방금 나눈 대화는 위에 이미 표시
+if previous:
     st.divider()
-    st.markdown("##### 💬 대화 기록")
-    for message in st.session_state.history:
+    st.markdown("##### 💬 이전 대화")
+    for message in previous:
         if message["role"] == "assistant" and not show_text:
             continue
         with st.chat_message(message["role"]):
