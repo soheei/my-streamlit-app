@@ -13,10 +13,21 @@ import pandas as pd
 import streamlit as st
 from openai import OpenAI
 
+CALENDAR_ERROR = ""
 try:
     from streamlit_calendar import calendar as st_calendar   # 월간 달력 컴포넌트
 except ImportError:
-    st_calendar = None   # 설치되어 있지 않으면 목록으로 대체 표시
+    # 앱을 실행 중인 파이썬(sys.executable)에 직접 설치를 시도한다 (Colab에서 환경이 달라 못 찾는 경우 대비)
+    import subprocess, sys
+    install = subprocess.run([sys.executable, "-m", "pip", "install", "-q", "streamlit-calendar"],
+                             capture_output=True, text=True)
+    try:
+        import importlib
+        importlib.invalidate_caches()
+        from streamlit_calendar import calendar as st_calendar
+    except ImportError as e:
+        st_calendar = None   # 그래도 안 되면 목록으로 대체 표시
+        CALENDAR_ERROR = f"{e} / pip: {(install.stderr or install.stdout)[-300:]}"
 
 # ---------------------------------------------------------------
 # 페이지 설정
@@ -532,6 +543,8 @@ def render_deadline_tab():
             st.info("달력에 표시할 마감일이 없습니다. 아래 표에서 마감일을 입력해 보세요.")
         elif st_calendar is None:
             st.warning("streamlit-calendar 패키지가 없어 목록으로 표시합니다. (pip install streamlit-calendar)")
+            if CALENDAR_ERROR:
+                st.code(CALENDAR_ERROR)
             st.dataframe(pd.DataFrame([{"마감일": d["due"], "업무": d["task"], "담당자": d["assignee"]}
                                        for d in sorted(dated, key=lambda x: x["due"])]), hide_index=True)
         else:
