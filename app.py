@@ -460,9 +460,17 @@ def transcribe(audio_bytes):
 def speech_clean(text):
     """화면용 Markdown을 음성으로 읽기 좋은 문장으로 바꾼다 (표는 '머리글 값' 형태로 풀어 읽음)."""
     lines, header = [], None
-    for line in text.split("\n"):
+    raw_lines = text.split("\n")
+    for index, line in enumerate(raw_lines):
         s = line.strip()
-        if s.startswith("|") and s.endswith("|"):
+        if not s:
+            lines.append("")
+            continue
+        next_line = next((v.strip() for v in raw_lines[index + 1:] if v.strip()), "")
+        is_header = "|" in next_line and all(
+            re.fullmatch(r":?-+:?", c.strip()) for c in next_line.strip("|").split("|"))
+        if "|" in s and (header is not None or is_header or
+                         (s.startswith("|") and s.endswith("|"))):
             cells = [c.strip() for c in s.strip("|").split("|")]
             if all(not c or re.fullmatch(r":?-+:?", c) for c in cells):
                 continue    # 구분선, 빈 행
@@ -485,6 +493,8 @@ def speech_clean(text):
 
 def synthesize(text):
     text = speech_clean(text)
+    if not text:
+        return None
     chunks =[text[start:start + 3000] for start in range(0, len(text), 3000)]
 
     def speak(chunk):
@@ -1534,6 +1544,8 @@ defaults = {
     "draft_id": 0,
     "recorder_key": 0,       # 녹음 위젯 초기화용
     "last_audio_hash": None, # 이미 인식한 녹음 (중복 인식 방지)
+    "voice_audio": None,     # 종료된 녹음을 위젯과 별도로 보관
+    "voice_error": None,
     "voice_text": None,      # 음성 인식 결과 (사용자가 확인하기 전까지 에이블에게 전달하지 않음)
 }
 for key, value in defaults.items():
@@ -1577,6 +1589,8 @@ with st.sidebar:
         st.session_state.last_summary_id = None
         st.session_state.last_audio_hash = None
         st.session_state.voice_text = None
+        st.session_state.voice_audio = None
+        st.session_state.voice_error = None
         st.session_state.recorder_key += 1
         st.rerun()
 
@@ -1624,6 +1638,8 @@ with tab_chat:
                 if st.button("❌", key="voice_cancel", use_container_width=True,
                              help="녹음을 취소합니다. 에이블에게 전달되지 않습니다."):
                     st.session_state.voice_text = None
+                    st.session_state.voice_audio = None
+                    st.session_state.voice_error = None
                     st.session_state.last_audio_hash = None
                     st.session_state.recorder_key += 1
                     st.rerun()
@@ -1635,22 +1651,32 @@ with tab_chat:
                                         key=f"recorder_{st.session_state.recorder_key}",
                                         label_visibility="collapsed")
             # 새 녹음이 끝나면 인식 결과만 보여 주고, 사용자가 확인해야 에이블에게 전달
-            voice_error = None
             if audio_file is not None:
                 audio_bytes = audio_file.getvalue()
+                if audio_bytes != st.session_state.voice_audio:
+                    st.session_state.voice_audio = audio_bytes
+                    st.session_state.voice_text = None
+                    st.session_state.voice_error = None
+            retry_voice = False
+            if st.session_state.voice_error:
+                retry_voice = st.button("🔄 음성 인식 다시 시도", key="voice_retry")
+            audio_bytes = st.session_state.voice_audio
+            if audio_bytes and (not st.session_state.voice_error or retry_voice):
                 audio_hash = hashlib.md5(audio_bytes).hexdigest()
                 if audio_hash != st.session_state.last_audio_hash:
                     voice_slot.caption("🎧 음성 인식 중...")
                     try:
                         st.session_state.voice_text = transcribe(audio_bytes).strip()
+                        if not st.session_state.voice_text:
+                            raise ValueError("인식된 내용이 없습니다. 재시도하거나 다시 녹음하세요.")
+                        st.session_state.last_audio_hash = audio_hash
+                        st.session_state.voice_error = None
                     except Exception as e:
                         st.session_state.voice_text = None
-                        voice_error = str(e)
-                    # 인식이 끝난 뒤에 처리 완료로 표시
-                    st.session_state.last_audio_hash = audio_hash
-            show_voice = st.session_state.voice_text is not None and audio_file is not None
-            if voice_error:
-                voice_slot.caption(f"⚠️ 음성 인식 중 오류가 발생했습니다: {voice_error}")
+                        st.session_state.voice_error = str(e)
+            show_voice = st.session_state.voice_text is not None
+            if st.session_state.voice_error:
+                voice_slot.caption(f"⚠️ 음성 인식 중 오류가 발생했습니다: {st.session_state.voice_error}")
             elif show_voice:
                 voice_slot.caption(f"🎧 인식된 내용: {st.session_state.voice_text or '(인식된 내용이 없습니다)'}")
             elif send_voice:
@@ -1728,9 +1754,6 @@ elif typed and typed.strip():
     pending_text = typed.strip()
 elif send_voice and st.session_state.voice_text:
     pending_text, pending_src = st.session_state.voice_text, "voice"
-    st.session_state.voice_text = None
-    st.session_state.last_audio_hash = None
-    st.session_state.recorder_key += 1     # 다음 실행에서 녹음 위젯을 비움
 
 # ---------------------------------------------------------------
 # 대화 영역: 기존 대화 출력 + 새 요청 처리
@@ -1783,14 +1806,24 @@ with chat_area:
                         f"받는 사람은 {new_draft['to']}, 제목은 {new_draft['subject']}입니다. "
                         f"본문입니다. {new_draft['body']}"
                     )
-                audio = synthesize(speech_text)
+                try:
+                    audio = synthesize(speech_text)
+                except Exception as e:
+                    audio = None
+                    st.warning(f"음성 변환에 실패했습니다. 텍스트로 답변을 표시합니다: {e}")
 
             # 음성 지시로 발송/취소된 경우 결과 줄을 먼저 표시
             for m in st.session_state.messages[n_before:]:
                 render_message(m)
             answer_msg = add_message(role="assistant", content=answer, audio=audio)
             prune_audio()
-            render_message(answer_msg, show_text, autoplay=True)
+            render_message(answer_msg, show_text or not audio, autoplay=True)
+            if src == "voice":
+                st.session_state.voice_text = None
+                st.session_state.voice_audio = None
+                st.session_state.voice_error = None
+                st.session_state.last_audio_hash = None
+                st.session_state.recorder_key += 1
         except Exception as e:
             st.error(f"오류가 발생했습니다: {e}")
 
