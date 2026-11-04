@@ -4,6 +4,7 @@ import json
 import ssl
 import hashlib
 import smtplib
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 from email.mime.text import MIMEText
@@ -50,7 +51,12 @@ if not os.getenv("OPENAI_API_KEY"):
     st.error("OPENAI_API_KEY가 등록되지 않았습니다. api_key.txt 또는 Secrets를 확인하세요.")
     st.stop()
 
-client = OpenAI()
+@st.cache_resource
+def get_client():
+    """OpenAI 클라이언트는 한 번만 만들어 재사용한다 (재실행마다 새로 만들면 연결/SSL 설정을 반복함)."""
+    return OpenAI()
+
+client = get_client()
 MODEL = "gpt-4.1-mini"
 
 # ---------------------------------------------------------------
@@ -341,14 +347,18 @@ def transcribe(audio_bytes):
 # 텍스트 → 음성 (TTS)
 # ---------------------------------------------------------------
 def synthesize(text):
-    audio = b""
-    for start in range(0, len(text), 3000):
-        speech = client.audio.speech.create(
-            model="tts-1", voice="alloy",
-            input=text[start:start + 3000], response_format="mp3"
-        )
-        audio += speech.content
-    return audio
+    chunks = [text[start:start + 3000] for start in range(0, len(text), 3000)]
+
+    def speak(chunk):
+        return client.audio.speech.create(
+            model="tts-1", voice="alloy", input=chunk, response_format="mp3"
+        ).content
+
+    if len(chunks) == 1:
+        return speak(chunks[0])
+    # 긴 글은 조각을 동시에 변환 (map은 순서를 유지)
+    with ThreadPoolExecutor(max_workers=min(4, len(chunks))) as pool:
+        return b"".join(pool.map(speak, chunks))
 
 # ---------------------------------------------------------------
 # LLM 호출 (멀티턴 + 도구 사용)
@@ -1006,7 +1016,7 @@ with tab_chat:
         st.markdown("<style>.st-key-voice_wrap{gap:.4rem;}</style>", unsafe_allow_html=True)
         with st.container(key="voice_wrap"):
             # 위 줄: [취소][요청] 인식된 내용 (버튼은 붙여서) / 아래 줄: 녹음 막대
-            cancel_col, send_col, text_col = st.columns([1, 1, 10], gap="small", vertical_alignment="center")
+            cancel_col, send_col, text_col = st.columns([1, 1, 15], gap="small", vertical_alignment="center")
             voice_slot = text_col.empty()   # 인식 중/결과/오류를 같은 자리에 한 줄로 표시 (레이아웃 고정)
             with cancel_col:
                 # 녹음 중이거나 녹음 후라도 위젯을 새로 만들어 녹음을 버린다 (에이블에게 전달되지 않음)
