@@ -1393,7 +1393,6 @@ pending_text, pending_src = None, "text"
 chip = st.session_state.pop("chip_request", None)
 if chip:
     pending_text = chip
-    st.toast("에이블에게 물어봤어요! 💬 대화 탭에서 답변을 확인하세요.")
 elif typed and typed.strip():
     pending_text = typed.strip()
 elif send_voice and st.session_state.voice_text:
