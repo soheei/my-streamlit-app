@@ -997,52 +997,24 @@ with head_right:
 tab_chat, tab_rec, tab_cal = st.tabs(["💬 대화", "🗂️ 회의 기록", "📅 마감 달력"])
 
 with tab_chat:
-    # 이메일 초안이 있으면 대화(왼쪽)와 초안(오른쪽)을 나란히 배치
+    # 이메일 초안이 있으면 대화(왼쪽)와 초안(오른쪽)을 나란히 배치하고, 음성 요청은 그 아래 전체 너비로 둠
     has_draft = st.session_state.email_draft is not None
     if has_draft:
         chat_col, draft_area = st.columns([3, 2])
     else:
         chat_col, draft_area = st.container(), st.container()
+    voice_box = st.container()
 
 with chat_col:
     chat_area = st.container(height=CHAT_HEIGHT, border=True)
 
+with voice_box:
     send_voice = False
     with st.expander("🎤 음성으로 요청하기 (녹음 후 인식된 내용을 확인하고 보내세요)", expanded=True):
-        # 취소/요청 버튼 두 개를 쌓았을 때 전체 높이가 녹음 막대 높이와 비슷하도록 줄임
-        st.markdown("<style>.st-key-voice_btns{gap:.5rem;}"
-                    ".st-key-voice_btns button{min-height:0;height:1.9rem;padding:0 .5rem;}</style>",
-                    unsafe_allow_html=True)
-        voice_slot = st.empty()   # 인식된 내용을 녹음 막대 위에 작은 글씨로 표시할 자리
-        rec_col, btn_col = st.columns([5, 1])
-        with btn_col:
-            btns = st.container(key="voice_btns")
-        with rec_col:
-            audio_file = st.audio_input("녹음 버튼을 눌러 말한 뒤, 다시 눌러 종료하세요.",
-                                        key=f"recorder_{st.session_state.recorder_key}",
-                                        label_visibility="collapsed")
-            # 새 녹음이 끝나면 인식 결과만 보여 주고, 사용자가 확인해야 에이블에게 전달
-            # 인식 중/결과/오류 모두 같은 자리(voice_slot)에 한 줄로 표시해 레이아웃이 움직이지 않게 함
-            voice_error = None
-            if audio_file is not None:
-                audio_bytes = audio_file.getvalue()
-                audio_hash = hashlib.md5(audio_bytes).hexdigest()
-                if audio_hash != st.session_state.last_audio_hash:
-                    st.session_state.last_audio_hash = audio_hash
-                    voice_slot.caption("🎧 음성 인식 중...")
-                    try:
-                        st.session_state.voice_text = transcribe(audio_bytes).strip()
-                    except Exception as e:
-                        st.session_state.voice_text = None
-                        voice_error = str(e)
-            show_voice = st.session_state.voice_text is not None and audio_file is not None
-            if voice_error:
-                voice_slot.caption(f"⚠️ 음성 인식 중 오류가 발생했습니다: {voice_error}")
-            elif show_voice:
-                voice_slot.caption(f"🎧 인식된 내용: {st.session_state.voice_text or '(인식된 내용이 없습니다)'}")
-            else:
-                voice_slot.caption("🎧 녹음을 마치면 인식된 내용이 여기에 표시됩니다.")
-        with btns:
+        # 위 줄: [취소] [요청] 인식된 내용 / 아래 줄: 녹음 막대
+        cancel_col, send_col, text_col = st.columns([1, 1, 6], vertical_alignment="center")
+        voice_slot = text_col.empty()   # 인식 중/결과/오류를 같은 자리에 한 줄로 표시 (레이아웃 고정)
+        with cancel_col:
             # 녹음 중이거나 녹음 후라도 위젯을 새로 만들어 녹음을 버린다 (에이블에게 전달되지 않음)
             if st.button("❌ 취소", key="voice_cancel",
                          help="녹음을 취소합니다. 에이블에게 전달되지 않습니다."):
@@ -1050,7 +1022,31 @@ with chat_col:
                 st.session_state.last_audio_hash = None
                 st.session_state.recorder_key += 1
                 st.rerun()
-            if show_voice:
+        audio_file = st.audio_input("녹음 버튼을 눌러 말한 뒤, 다시 눌러 종료하세요.",
+                                    key=f"recorder_{st.session_state.recorder_key}",
+                                    label_visibility="collapsed")
+        # 새 녹음이 끝나면 인식 결과만 보여 주고, 사용자가 확인해야 에이블에게 전달
+        voice_error = None
+        if audio_file is not None:
+            audio_bytes = audio_file.getvalue()
+            audio_hash = hashlib.md5(audio_bytes).hexdigest()
+            if audio_hash != st.session_state.last_audio_hash:
+                st.session_state.last_audio_hash = audio_hash
+                voice_slot.caption("🎧 음성 인식 중...")
+                try:
+                    st.session_state.voice_text = transcribe(audio_bytes).strip()
+                except Exception as e:
+                    st.session_state.voice_text = None
+                    voice_error = str(e)
+        show_voice = st.session_state.voice_text is not None and audio_file is not None
+        if voice_error:
+            voice_slot.caption(f"⚠️ 음성 인식 중 오류가 발생했습니다: {voice_error}")
+        elif show_voice:
+            voice_slot.caption(f"🎧 인식된 내용: {st.session_state.voice_text or '(인식된 내용이 없습니다)'}")
+        else:
+            voice_slot.caption("🎧 녹음을 마치면 인식된 내용이 여기에 표시됩니다.")
+        if show_voice:
+            with send_col:
                 send_voice = st.button("✅ 요청", type="primary", key="voice_send",
                                        disabled=not st.session_state.voice_text)
 
