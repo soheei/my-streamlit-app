@@ -23,6 +23,7 @@ st.set_page_config(page_title="AI 개인비서 에이블", page_icon="🤖", lay
 
 ROBOT_URL = "https://raw.githubusercontent.com/Jangrae/img/master/ai_robot.png"
 USER_AVATAR = "🧑‍💼"
+ROBOT_AVATAR = "🤖"    # 채팅 아바타 (이미지는 잘려 보여 이모지 사용)
 CHAT_HEIGHT = 400      # 대화 영역 높이(px)
 MAX_HISTORY = 10       # LLM에 전달하는 대화 개수
 KEEP_AUDIO = 10        # 음성을 보관하는 최근 답변 개수
@@ -454,7 +455,7 @@ def render_message(m, show_text=True, autoplay=False):
                 st.caption(f"{m['time']}")
             st.markdown(m["content"])
     else:
-        with st.chat_message("assistant", avatar=ROBOT_URL):
+        with st.chat_message("assistant", avatar=ROBOT_AVATAR):
             st.caption(f"에이블 · {m['time']}")
             if show_text:
                 st.markdown(m["content"])
@@ -996,8 +997,15 @@ with head_right:
 tab_chat, tab_rec, tab_cal = st.tabs(["💬 대화", "🗂️ 회의 기록", "📅 마감 달력"])
 
 with tab_chat:
+    # 이메일 초안이 있으면 대화(왼쪽)와 초안(오른쪽)을 나란히 배치
+    has_draft = st.session_state.email_draft is not None
+    if has_draft:
+        chat_col, draft_area = st.columns([3, 2])
+    else:
+        chat_col, draft_area = st.container(), st.container()
+
+with chat_col:
     chat_area = st.container(height=CHAT_HEIGHT, border=True)
-    draft_area = st.container()
 
     send_voice = False
     with st.expander("🎤 음성으로 요청하기 (녹음 후 인식된 내용을 확인하고 보내세요)", expanded=True):
@@ -1008,7 +1016,7 @@ with tab_chat:
                                         label_visibility="collapsed")
         with cancel_col:
             # 녹음 중이거나 녹음 후라도 위젯을 새로 만들어 녹음을 버린다 (에이블에게 전달되지 않음)
-            if st.button("❌ 취소", key="voice_cancel", use_container_width=True,
+            if st.button("❌ 취소", key="voice_cancel",
                          help="녹음을 취소합니다. 에이블에게 전달되지 않습니다."):
                 st.session_state.voice_text = None
                 st.session_state.last_audio_hash = None
@@ -1030,8 +1038,9 @@ with tab_chat:
         if st.session_state.voice_text is not None and audio_file is not None:
             st.caption("🎧 인식된 내용")
             st.info(st.session_state.voice_text or "(인식된 내용이 없습니다)")
-            send_voice = st.button("✅ 이 내용으로 요청", type="primary", key="voice_send",
-                                   disabled=not st.session_state.voice_text)
+            with cancel_col:   # 취소 버튼 바로 아래에 요청 버튼 배치
+                send_voice = st.button("✅ 요청", type="primary", key="voice_send",
+                                       disabled=not st.session_state.voice_text)
 
 typed = st.chat_input("메시지를 입력하세요. (예: 회의 내용을 요약해 줘)")
 
@@ -1082,7 +1091,7 @@ elif send_voice and st.session_state.voice_text:
 with chat_area:
     old = st.session_state.messages
     if not old and not pending_text:
-        with st.chat_message("assistant", avatar=ROBOT_URL):
+        with st.chat_message("assistant", avatar=ROBOT_AVATAR):
             st.markdown("안녕하세요, 김 대리님! 개인비서 **에이블**입니다. 👋")
             if meeting_file is None:
                 st.warning("먼저 왼쪽에서 회의록(txt)을 업로드해 주세요.")
@@ -1135,6 +1144,9 @@ with chat_area:
             answer_msg = add_message(role="assistant", content=answer, audio=audio)
             prune_audio()
             render_message(answer_msg, show_text, autoplay=True)
+            # 초안이 생기거나 사라졌으면 화면 배치가 바뀌어야 하므로 한 번 다시 그림
+            if (st.session_state.email_draft is not None) != has_draft:
+                st.session_state.deadline_changed = True
         except Exception as e:
             st.error(f"오류가 발생했습니다: {e}")
 
