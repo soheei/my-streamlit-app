@@ -4,6 +4,7 @@ import os
 import json
 import ssl
 import hashlib
+import inspect
 import re
 import smtplib
 from concurrent.futures import ThreadPoolExecutor
@@ -1000,15 +1001,21 @@ def queue_request(text):
 def ask_in_chat(text):
     """우선순위 탭의 '묻기' 버튼: 요청을 예약하고 대화 탭으로 이동시킨다."""
     queue_request(text)
+    st.session_state.main_tabs = "💬 대화"
     st.session_state.go_chat = True
 
 def switch_to_chat_tab():
-    """st.tabs는 코드로 탭을 바꿀 수 없어, 브라우저에서 '대화' 탭 버튼을 대신 클릭한다."""
+    """탭 상태 제어를 지원하지 않는 구버전 Streamlit의 대화 탭 이동."""
     # 같은 내용이면 화면이 다시 실행되지 않으므로 매번 다른 값을 넣는다
     components.html(
         f"<script>/* {time.time()} */"
-        "const tabs = window.parent.document.querySelectorAll('button[role=\"tab\"]');"
-        "if (tabs.length) tabs[0].click();</script>", height=0)
+        "let attempts = 0;"
+        "function activateChat() {"
+        "const tab = Array.from(window.parent.document.querySelectorAll('button[role=\"tab\"]'))"
+        ".find(el => el.textContent.trim() === '💬 대화');"
+        "if (tab) { tab.click(); return; }"
+        "if (++attempts < 50) setTimeout(activateChat, 100);"
+        "} activateChat();</script>", height=0)
 
 def briefing_text(tasks):
     """회의록을 올리면 에이블이 먼저 건네는 브리핑 메시지 (LLM 호출 없이 결과로 작성)."""
@@ -1587,7 +1594,11 @@ with head_right:
     badges.append(f":blue-badge[✉️ {recipient}]" if recipient else ":orange-badge[✉️ 수신자 없음]")
     st.markdown(" ".join(badges))
 
-tab_chat, tab_pri, tab_rec, tab_cal = st.tabs(["💬 대화", "🎯 우선순위", "🗂️ 회의 기록", "📅 마감 달력"])
+# 최신 버전은 공식 상태 제어를 사용하고, 구버전은 아래의 브라우저 이동을 사용한다.
+supports_tab_state = {"key", "on_change"}.issubset(inspect.signature(st.tabs).parameters)
+tab_options = {"key": "main_tabs", "on_change": "rerun"} if supports_tab_state else {}
+tab_chat, tab_pri, tab_rec, tab_cal = st.tabs(
+    ["💬 대화", "🎯 우선순위", "🗂️ 회의 기록", "📅 마감 달력"], **tab_options)
 
 with tab_chat:
     # 대화창은 전체 너비. 이메일 초안은 대화창 안(맨 아래)에 카드로 들어가 함께 스크롤된다.
@@ -1712,7 +1723,7 @@ pending_text, pending_src = None, "text"
 chip = st.session_state.pop("chip_request", None)
 if chip:
     pending_text = chip
-    if st.session_state.pop("go_chat", False):
+    if st.session_state.pop("go_chat", False) and not supports_tab_state:
         switch_to_chat_tab()     # 답변이 만들어지기 전에 먼저 대화 탭으로 이동
 elif typed and typed.strip():
     pending_text = typed.strip()
