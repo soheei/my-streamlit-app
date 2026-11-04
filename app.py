@@ -1,4 +1,3 @@
-
 import os
 import json
 import ssl
@@ -9,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from email.utils import parseaddr
 
 import pandas as pd
@@ -17,6 +17,25 @@ from openai import OpenAI
 
 import calendar as pycal
 from html import escape
+
+# PDF 보고서 (reportlab: PDF 만들기 / pypdfium2: 화면 미리보기)
+import io
+import urllib.request
+try:   # reportlab이 설치되지 않아도 앱은 동작하도록 (PDF 기능만 꺼짐)
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.enums import TA_CENTER
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table,
+                                    TableStyle, HRFlowable, KeepTogether)
+    PDF_READY = True
+except ImportError:
+    PDF_READY = False
+PDF_MISSING_MSG = "PDF 기능을 쓰려면 requirements.txt에 reportlab, pypdfium2를 추가한 뒤 앱을 재시작(Reboot)하세요."
 
 # ---------------------------------------------------------------
 # 페이지 설정
@@ -61,6 +80,93 @@ client = get_client()
 MODEL = "gpt-4.1-mini"
 
 # ---------------------------------------------------------------
+# 메일 본문 변환: 마크다운(■ 소제목, - 목록, | 표 |, **굵게**) → HTML 메일 / 깔끔한 텍스트
+# ---------------------------------------------------------------
+def md_blocks(text):
+    """본문을 블록 목록으로 나눈다. ("head"|"bullet"|"text"|"blank", 문자열) / ("table", [[칸, ...], ...])"""
+    blocks, table = [], []
+    for raw in (text or "").splitlines() + [""]:
+        line = raw.strip()
+        if line.startswith("|") and line.count("|") >= 2:          # 마크다운 표의 한 줄
+            cells = [c.strip() for c in line.strip("|").split("|")]
+            if not all(re.fullmatch(r":?-{2,}:?", c) for c in cells if c):   # |---|---| 구분선은 건너뜀
+                table.append(cells)
+            continue
+        if table:
+            rows = [r for r in table if any(r)]                     # 빈 행 제거
+            if len(rows) > 1:
+                blocks.append(("table", rows))
+            table = []
+        if not line:
+            blocks.append(("blank", ""))
+        elif line.startswith("■") or re.match(r"^#{1,6}\s", line):
+            blocks.append(("head", line.lstrip("■# ").strip()))
+        elif re.match(r"^[-*•·]\s+", line):
+            blocks.append(("bullet", re.sub(r"^[-*•·]\s+", "", line)))
+        else:
+            blocks.append(("text", line))
+    return blocks
+
+def inline_html(text):
+    """특수문자를 안전하게 바꾸고 **굵게**만 <b>로 살린다."""
+    return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escape(text, quote=False))
+
+def body_to_html(text):
+    """메일 본문을 HTML로 바꾼다. 메일 앱 호환을 위해 스타일은 태그에 직접 넣는다."""
+    td = "border:1px solid #c8d1dc;padding:6px 10px;vertical-align:top;"
+    out, bullets = [], []
+
+    def flush_bullets():
+        if bullets:
+            out.append("<ul style='margin:4px 0 10px 0;padding-left:22px;'>" +
+                       "".join(f"<li style='margin:2px 0;'>{b}</li>" for b in bullets) + "</ul>")
+            bullets.clear()
+
+    for kind, value in md_blocks(text):
+        if kind != "bullet":
+            flush_bullets()
+        if kind == "head":
+            title, sep, rest = value.partition(":")
+            out.append(f"<h3 style='margin:18px 0 6px 0;font-size:16px;color:#1f3a5f;'>"
+                       f"■ {inline_html(title.strip())}</h3>")
+            if rest.strip():
+                out.append(f"<p style='margin:4px 0;'>{inline_html(rest.strip())}</p>")
+        elif kind == "bullet":
+            bullets.append(inline_html(value))
+        elif kind == "table":
+            head, *rows = value
+            n = max(len(r) for r in value)
+            html = ["<table style='border-collapse:collapse;margin:6px 0 12px 0;font-size:14px;'>",
+                    "<tr>" + "".join(f"<th style='{td}background:#e8eef7;text-align:left;white-space:nowrap;'>"
+                                     f"{inline_html(c)}</th>" for c in head + [""] * (n - len(head))) + "</tr>"]
+            for r in rows:
+                html.append("<tr>" + "".join(   # 짧은 칸(담당자, 우선순위 등)은 줄바꿈하지 않음
+                    f"<td style='{td}{'white-space:nowrap;' if len(c.replace('**', '')) <= 8 else ''}'>"
+                    f"{inline_html(c)}</td>" for c in r + [""] * (n - len(r))) + "</tr>")
+            out.append("".join(html) + "</table>")
+        elif kind == "text":
+            color = "color:#c0392b;font-weight:bold;" if "확인 필요" in value and "회의 날짜" in value else ""
+            out.append(f"<p style='margin:4px 0;{color}'>{inline_html(value)}</p>")
+    flush_bullets()
+    return ("<div style=\"font-family:'Malgun Gothic','Apple SD Gothic Neo',sans-serif;"
+            "font-size:14px;line-height:1.6;color:#222;\">" + "".join(out) + "</div>")
+
+def body_to_plain(text):
+    """HTML을 못 여는 메일 앱용: 표는 '담당자: … / 업무 내용: …' 줄로, **굵게** 기호는 제거."""
+    lines = []
+    for kind, value in md_blocks(text):
+        value = value.replace("**", "") if isinstance(value, str) else value
+        if kind == "table":
+            head, *rows = [[c.replace("**", "") for c in r] for r in value]
+            for i, r in enumerate(rows, start=1):
+                lines.append(f"{i}. " + " / ".join(f"{h}: {c}" for h, c in zip(head, r) if c))
+        elif kind == "bullet":
+            lines.append(f"- {value}")
+        else:
+            lines.append(value)
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+# ---------------------------------------------------------------
 # 이메일 발송 함수 (외부 도구)
 # ---------------------------------------------------------------
 def send_email(to, subject, body):
@@ -73,7 +179,10 @@ def send_email(to, subject, body):
     if not isinstance(subject, str) or any(c in subject for c in "\r\n"):
         return {"status": "failed", "error": "올바른 메일 제목이 필요합니다."}
     try:
-        msg = MIMEText(body, "plain", "utf-8")
+        # 텍스트 + HTML을 함께 보냄: 메일 앱은 HTML(표가 표로 보임)을 우선 표시하고, 못 열면 텍스트를 표시
+        msg = MIMEMultipart("alternative")
+        msg.attach(MIMEText(body_to_plain(body), "plain", "utf-8"))
+        msg.attach(MIMEText(body_to_html(body), "html", "utf-8"))
         msg["Subject"], msg["From"], msg["To"] = subject, sender, to
         with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as s:
             s.starttls(context=ssl.create_default_context())
@@ -318,6 +427,7 @@ def build_instructions(meeting_text, recipient, draft=None, deadlines=None):
 2. 회의명은 회의록에서 정하고 지어내지 마세요.
 3. 과거 회의를 요청받으면 search_summaries로 찾아 저장된 내용을 바꾸지 말고 전달하세요. 여러 건이면 날짜와 회의명 목록을 보여 주고 어느 회의인지 되물으세요.
 4. 저장된 요약을 메일로 보내 달라고 하면 search_summaries로 찾은 뒤 send_email로 초안을 만드세요.
+5. 요약을 PDF나 보고서로 달라고 하면 회의 전체를 요약해 save_summary로 저장한 뒤, "대화창 아래의 PDF 보고서 저장 버튼으로 내려받거나 미리보기로 확인하실 수 있습니다"라고 안내하세요. 이미 저장된 회의는 회의 기록 탭에서 받을 수 있습니다.
 
 [회의록 분석]
 1. 김 대리에게 배정된 업무를 물으면 담당 업무, 기한, 산출물, 진행 방식, 관련 사항을 자세히 안내하세요.
@@ -414,9 +524,6 @@ def speech_clean(text):
         s = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", s)   # 링크
         lines.append(s)
     result = "\n".join(lines)
-    # 2026-11-13 → 2026년 11월 13일 (숫자를 하나씩 끊어 읽지 않고 날짜로 읽게 함)
-    result = re.sub(r"(?<!\d)(\d{4})-(\d{1,2})-(\d{1,2})(?!\d)",
-                    lambda m: f"{m[1]}년 {int(m[2])}월 {int(m[3])}일", result)
     result = re.sub(r"[*_`~■□▶▷●○◆◇⚠️]|️", "", result)  # 남은 서식·장식 기호
     return re.sub(r"\n{2,}", "\n", result).strip()
 
@@ -479,6 +586,8 @@ def ask_able(user_text, history, meeting_text, recipient):
                 elif item.name == "save_summary":
                     result = save_summary(arguments.get("title", ""), arguments.get("meeting_date", ""),
                                           arguments.get("summary", ""))
+                    if result.get("status") == "success":
+                        st.session_state.last_summary_id = result["id"]   # 대화 탭에 PDF 버튼 표시용
                     st.session_state.deadline_changed = True   # 회의 기록 탭을 새 값으로 다시 그리기 위함
                 elif item.name == "search_summaries":
                     result = search_summaries(arguments.get("keyword", ""), arguments.get("date_from", ""),
@@ -1037,6 +1146,231 @@ def search_summaries(keyword, date_from, date_to):
     except Exception as e:
         return {"status": "failed", "error": str(e)}
 
+# ---------------------------------------------------------------
+# 회의 요약 → PDF 보고서 (다운로드 + 화면 미리보기)
+# ---------------------------------------------------------------
+FONT_DIR = "fonts"
+NANUM_URL = "https://github.com/google/fonts/raw/main/ofl/nanumgothic/NanumGothic-{}.ttf"
+SYSTEM_FONTS = {   # Colab: apt-get install fonts-nanum / Streamlit Cloud: packages.txt에 fonts-nanum
+    "Regular": ["/usr/share/fonts/truetype/nanum/NanumGothic.ttf"],
+    "Bold": ["/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf"],
+}
+
+def find_font(weight):
+    """나눔고딕 TTF 경로를 찾는다. 시스템 폰트 → fonts 폴더 → 인터넷에서 내려받기 순."""
+    local = os.path.join(FONT_DIR, f"NanumGothic-{weight}.ttf")
+    for p in SYSTEM_FONTS[weight] + [local]:
+        if os.path.exists(p) and os.path.getsize(p) > 100_000:
+            return p
+    try:
+        os.makedirs(FONT_DIR, exist_ok=True)
+        urllib.request.urlretrieve(NANUM_URL.format(weight), local)
+        if os.path.getsize(local) > 100_000:
+            return local
+    except Exception:
+        pass
+    return None
+
+@st.cache_resource
+def register_korean_font():
+    """PDF용 한글 폰트를 등록하고 (본문, 굵게) 폰트 이름을 돌려준다."""
+    regular, bold = find_font("Regular"), find_font("Bold")
+    try:
+        if regular:
+            pdfmetrics.registerFont(TTFont("Nanum", regular))
+            pdfmetrics.registerFont(TTFont("Nanum-Bold", bold or regular))
+            pdfmetrics.registerFontFamily("Nanum", normal="Nanum", bold="Nanum-Bold",
+                                          italic="Nanum", boldItalic="Nanum-Bold")
+            return "Nanum", "Nanum-Bold"
+    except Exception:
+        pass
+    # 나눔 폰트를 못 구하면 reportlab 내장 한글 폰트 사용 (별도 파일 필요 없음)
+    pdfmetrics.registerFont(UnicodeCIDFont("HYGothic-Medium"))
+    pdfmetrics.registerFontFamily("HYGothic-Medium", normal="HYGothic-Medium", bold="HYGothic-Medium",
+                                  italic="HYGothic-Medium", boldItalic="HYGothic-Medium")
+    return "HYGothic-Medium", "HYGothic-Medium"
+
+EMOJI = re.compile("[\U00010000-\U0010FFFF☀-➿️‍]")
+
+def pdf_text(text):
+    """PDF 문단용 문자열: 이모지 제거 → XML 이스케이프 → **굵게** 를 <b>로."""
+    text = escape(EMOJI.sub("", text).strip(), quote=False)
+    return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+
+def parse_summary(summary):
+    """요약 텍스트를 블록 목록으로 바꾼다.
+    ("head", 제목) / ("text", 문장) / ("bullet", 문장) / ("table", [[칸...], ...]) / ("warn", 문장)"""
+    blocks, table = [], []
+    for raw in summary.splitlines() + [""]:
+        line = raw.strip()
+        if line.startswith("|"):                      # 마크다운 표
+            cells = [c.strip() for c in line.strip("|").split("|")]
+            if not all(re.fullmatch(r":?-{2,}:?", c) for c in cells if c):   # |---|---| 구분선 제외
+                table.append(cells)
+            continue
+        if table:
+            if any(any(c for c in row) for row in table[1:]):   # 빈 행만 있는 표는 버림
+                blocks.append(("table", [r for r in table if any(r)]))
+            table = []
+        if not line:
+            continue
+        if "회의 날짜 확인 필요" in line and not line.startswith("■"):
+            blocks.append(("warn", line))
+        elif line.startswith("■") or re.match(r"^#{1,6}\s", line):
+            title = line.lstrip("■# ").strip()
+            title, _, rest = title.partition(":")
+            blocks.append(("head", title.strip().strip("*")))
+            if rest.strip():
+                blocks.append(("text", rest.strip()))
+        elif re.match(r"^[-*•·]\s+", line):
+            blocks.append(("bullet", re.sub(r"^[-*•·]\s+", "", line)))
+        else:
+            blocks.append(("text", line))
+    return blocks
+
+@st.cache_data(show_spinner=False)
+def make_summary_pdf(title, meeting_date_str, summary, saved_at=""):
+    """회의 요약본을 A4 보고서 형식의 PDF(bytes)로 만든다."""
+    font, bold = register_korean_font()
+    navy = colors.HexColor("#1f3a5f")
+    line_color = colors.HexColor("#b8c4d6")
+    head_bg = colors.HexColor("#e8eef7")
+    base = ParagraphStyle("base", fontName=font, fontSize=10.5, leading=17, wordWrap="CJK")
+    styles = {
+        "title": ParagraphStyle("title", parent=base, fontName=bold, fontSize=20, leading=28,
+                                alignment=TA_CENTER, textColor=navy),
+        "sub": ParagraphStyle("sub", parent=base, fontSize=10, alignment=TA_CENTER, textColor=colors.grey),
+        "head": ParagraphStyle("head", parent=base, fontName=bold, fontSize=12.5, leading=18,
+                               textColor=navy, spaceBefore=10, spaceAfter=4),
+        "text": ParagraphStyle("text", parent=base, leftIndent=4 * mm),
+        "bullet": ParagraphStyle("bullet", parent=base, leftIndent=8 * mm, bulletIndent=4 * mm),
+        "cell": ParagraphStyle("cell", parent=base, fontSize=9, leading=13),
+        "cellb": ParagraphStyle("cellb", parent=base, fontName=bold, fontSize=9, leading=13),
+        "warn": ParagraphStyle("warn", parent=base, fontName=bold, textColor=colors.HexColor("#c0392b")),
+        "foot": ParagraphStyle("foot", parent=base, fontSize=8.5, textColor=colors.grey, alignment=TA_CENTER),
+    }
+    P = lambda text, s: Paragraph(pdf_text(text), styles[s])
+    width = A4[0] - 40 * mm
+
+    def grid(table, header_cols=None):
+        style = [("GRID", (0, 0), (-1, -1), 0.5, line_color), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                 ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4)]
+        if header_cols:   # 개요 표: 지정한 열에 배경색
+            style += [("BACKGROUND", (c, 0), (c, -1), head_bg) for c in header_cols]
+        else:             # 액션 아이템 표: 첫 행이 머리글
+            style += [("BACKGROUND", (0, 0), (-1, 0), head_bg)]
+        table.setStyle(TableStyle(style))
+        return table
+
+    now = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d %H:%M")
+    story = [P("회의 결과 보고서", "title"), P(title or "회의 요약", "sub"), Spacer(1, 6 * mm)]
+
+    info = [["회의명", title or "-", "회의 날짜", meeting_date_str or "-"],
+            ["작성자", "김 대리 (AI 개인비서 에이블 작성)", "작성 일시", saved_at or now]]
+    story.append(grid(Table([[P(c, "cellb" if i % 2 == 0 else "cell") for i, c in enumerate(r)] for r in info],
+                            colWidths=[22 * mm, 68 * mm, 22 * mm, 58 * mm]), header_cols=[0, 2]))
+    story += [Spacer(1, 4 * mm), HRFlowable(width="100%", thickness=1, color=navy), Spacer(1, 2 * mm)]
+
+    number, pending_head = 0, None
+    for kind, value in parse_summary(summary):
+        if kind == "head":
+            number += 1
+            pending_head = P(f"{number}. {value}", "head")   # 다음 내용과 같은 페이지에 묶음
+            continue
+        if kind == "table":
+            n = max(len(r) for r in value)
+            rows = [r + [""] * (n - len(r)) for r in value]
+            # 담당자 | 업무 내용 | 관련 논의 사항 | 마감일 | 우선순위
+            widths = [w * mm for w in (22, 52, 46, 32, 18)] if n == 5 else [width / n] * n
+            item = grid(Table([[P(c, "cellb" if i == 0 else "cell") for c in r] for i, r in enumerate(rows)],
+                              colWidths=widths, repeatRows=1))
+        elif kind == "warn":
+            item = P("※ " + value, "warn")
+        elif kind == "bullet":
+            item = Paragraph(pdf_text(value), styles["bullet"], bulletText="•")
+        else:
+            item = P(value, "text")
+        if pending_head is not None:
+            story.append(KeepTogether([pending_head, item]) if kind != "table" else pending_head)
+            if kind == "table":
+                story.append(item)
+            pending_head = None
+        else:
+            story.append(item)
+    if pending_head is not None:
+        story += [pending_head, P("기록에 없음", "text")]
+
+    story += [Spacer(1, 8 * mm), HRFlowable(width="100%", thickness=0.5, color=colors.lightgrey),
+              P(f"본 보고서는 회의 기록을 바탕으로 AI 개인비서 에이블이 작성했습니다. 출력 일시 {now}", "foot")]
+
+    def page_number(canvas, doc):
+        canvas.saveState()
+        canvas.setFont(font, 8.5)
+        canvas.setFillColor(colors.grey)
+        canvas.drawCentredString(A4[0] / 2, 10 * mm, f"- {doc.page} -")
+        canvas.restoreState()
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, title=f"회의 결과 보고서 - {title}", author="AI 개인비서 에이블",
+                            leftMargin=20 * mm, rightMargin=20 * mm, topMargin=18 * mm, bottomMargin=18 * mm)
+    doc.build(story, onFirstPage=page_number, onLaterPages=page_number)
+    return buf.getvalue()
+
+def pdf_file_name(record):
+    safe = re.sub(r'[\\/:*?"<>|\s]+', "_", record["title"]).strip("_") or "회의"
+    return f"회의보고서_{record['meeting_date']}_{safe}.pdf"
+
+def record_pdf(record):
+    return make_summary_pdf(record["title"], record["meeting_date"], record["summary"],
+                            record.get("saved_at", ""))
+
+def pdf_download_button(record, key, label="📄 PDF 보고서 저장", container=st):
+    """저장된 요약 1건을 PDF 보고서로 내려받는 버튼."""
+    if not PDF_READY:
+        container.button(label, key=key, disabled=True, help=PDF_MISSING_MSG, use_container_width=True)
+        return
+    try:
+        data = record_pdf(record)
+    except Exception as e:
+        container.error(f"PDF 생성 실패: {e}")
+        return
+    container.download_button(label, data=data, file_name=pdf_file_name(record),
+                              mime="application/pdf", key=key, use_container_width=True)
+
+@st.cache_data(show_spinner=False)
+def pdf_to_images(pdf_bytes, scale=1.6):
+    """PDF 각 페이지를 PNG 이미지(bytes)로 바꾼다. 화면 미리보기용."""
+    import pypdfium2 as pdfium
+    pages = []
+    doc = pdfium.PdfDocument(pdf_bytes)
+    try:
+        for i in range(len(doc)):
+            image = doc[i].render(scale=scale).to_pil()
+            buf = io.BytesIO()
+            image.save(buf, format="PNG")
+            pages.append(buf.getvalue())
+    finally:
+        doc.close()
+    return pages
+
+def show_pdf_preview(record):
+    """PDF 보고서를 페이지 이미지로 화면에 보여 준다 (내려받을 PDF와 똑같은 모양)."""
+    if not PDF_READY:
+        st.warning(PDF_MISSING_MSG)
+        return
+    try:
+        pages = pdf_to_images(record_pdf(record))
+    except Exception as e:
+        st.error(f"PDF 미리보기 실패: {e}")
+        return
+    _, mid, _ = st.columns([1, 6, 1])   # 화면이 넓어도 A4 비율로 보기 좋게 가운데 배치
+    with mid:
+        for no, png in enumerate(pages, start=1):
+            with st.container(border=True):
+                st.image(png)
+            if len(pages) > 1:
+                st.caption(f"{no} / {len(pages)} 페이지")
+
 def render_records_tab(recipient):
     """회의 기록 탭: 저장된 요약을 검색하고, 메일로 보내거나 삭제한다."""
     keyword = st.text_input("🔎 회의 기록 검색", placeholder="회의명이나 내용 키워드")
@@ -1050,16 +1384,21 @@ def render_records_tab(recipient):
         with st.expander(f"📅 {d['meeting_date']}   {d['title']}"):
             st.markdown(d["summary"])
             st.caption(f"저장 시각: {d['saved_at']}")
-            c1, c2, _ = st.columns([1.3, 1, 2])
-            if c1.button("📧 기본 수신자에게 보내기", key=f"mail_{d['id']}", disabled=not recipient):
+            c1, c3, c2 = st.columns([1.3, 1.3, 1])
+            pdf_download_button(d, key=f"pdf_{d['id']}", container=c3)
+            if c1.button("📧 기본 수신자에게 보내기", key=f"mail_{d['id']}", disabled=not recipient,
+                         use_container_width=True):
                 r = send_email(recipient, f"[회의 요약] {d['title']} ({d['meeting_date']})", d["summary"])
                 if r["status"] == "success":
                     st.success(f"{recipient} 로 보냈습니다.")
                 else:
                     st.error(f"발송 실패: {r.get('error')}")
-            if c2.button("🗑️ 삭제", key=f"del_{d['id']}"):
+            if c2.button("🗑️ 삭제", key=f"del_{d['id']}", use_container_width=True):
                 write_summaries([x for x in load_summaries() if x["id"] != d["id"]])
                 st.rerun()
+            # expander 안에는 expander를 넣을 수 없어 토글로 미리보기를 연다
+            if st.toggle("👁️ PDF 보고서 미리보기", key=f"preview_{d['id']}"):
+                show_pdf_preview(d)
 
 def shift_month(delta):
     m = st.session_state.cal_month
@@ -1208,20 +1547,50 @@ defaults = {
     "priority_key": None,    # 마지막으로 분류한 회의록/날짜 식별값
     "messages": [],          # 화면용 대화 기록 (text / mail)
     "email_draft": None,     # 발송 전 확인 대기 중인 이메일 초안
+    "last_summary_id": None, # 대화에서 마지막으로 저장한 회의 요약 (PDF 보고서용)
     "draft_id": 0,
     "recorder_key": 0,       # 녹음 위젯 초기화용
     "last_audio_hash": None, # 이미 인식한 녹음 (중복 인식 방지)
     "voice_text": None,      # 음성 인식 결과 (사용자가 확인하기 전까지 에이블에게 전달하지 않음)
+    "quick_version": 0,      # 자주 쓰는 요청 편집기 초기화용
+    "quick_base": [          # 자주 쓰는 요청 기본값
+        "회의 내용을 요약해 줘.",
+        "나에게 배정된 업무를 자세히 알려줘.",
+        "후속 조치와 마감 기한만 정리해 줘.",
+        "방금 답변을 이메일로 보내줘.",
+        "제일 급한 업무부터 알려줘.",
+        "이번 주 마감 일정 알려줘.",
+    ],
 }
 for key, value in defaults.items():
     if key not in st.session_state:
         st.session_state[key] = value
 
 # ---------------------------------------------------------------
-# 사이드바: 이미지, 회의록, 이메일, 설정
+# 사이드바: 이미지, 회의록, 이메일, 자주 쓰는 요청, 설정
 # ---------------------------------------------------------------
+queued = None   # 자주 쓰는 요청 버튼으로 들어온 요청
+
 with st.sidebar:
     st.image(ROBOT_URL)
+
+    st.subheader("⚡ 자주 쓰는 요청")
+    quick_area = st.container()
+    with st.expander("✏️ 수정 / 추가 / 삭제"):
+        st.caption("셀을 눌러 수정, 맨 아래 빈 행에 입력해 추가, 행 선택 후 Delete로 삭제합니다.")
+        edited = st.data_editor(
+            pd.DataFrame({"요청": st.session_state.quick_base}),
+            num_rows="dynamic", use_container_width=True,
+            key=f"quick_editor_{st.session_state.quick_version}",
+        )
+        if st.button("기본값으로 되돌리기"):
+            st.session_state.quick_version += 1
+            st.rerun()
+    quick_requests = [str(r).strip() for r in edited["요청"].dropna() if str(r).strip()]
+    with quick_area:
+        for i, q in enumerate(quick_requests):
+            if st.button(q, key=f"quick_{i}", use_container_width=True):
+                queued = q    
 
     st.subheader("📎 회의록")
     meeting_file = st.file_uploader("회의록(txt) 파일", type=["txt"], label_visibility="collapsed")
@@ -1251,6 +1620,7 @@ with st.sidebar:
     if st.button("🗑️ 대화 초기화", use_container_width=True):
         st.session_state.messages = []
         st.session_state.email_draft = None
+        st.session_state.last_summary_id = None
         st.session_state.last_audio_hash = None
         st.session_state.voice_text = None
         st.session_state.recorder_key += 1
@@ -1275,13 +1645,7 @@ with tab_chat:
     # 대화창은 전체 너비. 이메일 초안은 대화창 안(맨 아래)에 카드로 들어가 함께 스크롤된다.
     chat_area = st.container(height=CHAT_HEIGHT, border=True)
     draft_area = chat_area
-
-    # 자주 쓰는 요청: 누르면 해당 문장이 에이블에게 바로 전달된다
-    quick_requests = [("📋", "회의 내용 요약해 줘"), ("🔥", "제일 급한 업무부터 알려줘"),
-                      ("📅", "이번 주 마감 일정 알려줘")]
-    for col, (icon, text) in zip(st.columns(len(quick_requests)), quick_requests):
-        col.button(f"{icon} {text}", key=f"quick_{text}", on_click=queue_request,
-                   args=(text,), use_container_width=True)
+    report_area = st.container()   # 방금 요약한 회의의 PDF 저장 / 미리보기
 
     send_voice = False
     with st.expander("🎤 음성으로 요청하기 (녹음 후 인식된 내용을 확인하고 보내세요)", expanded=True):
@@ -1387,12 +1751,15 @@ with tab_pri:
         st.info("왼쪽에서 회의록(txt)을 업로드하면 김 대리님 업무를 긴급·중요 기준으로 나눠 보여 드려요.")
 
 # ---------------------------------------------------------------
-# 이번 실행에서 처리할 요청 결정: 버튼 요청 > 텍스트 > 새 녹음
+# 이번 실행에서 처리할 요청 결정: 자주 쓰는 요청 > 텍스트 > 새 녹음
 # ---------------------------------------------------------------
 pending_text, pending_src = None, "text"
 chip = st.session_state.pop("chip_request", None)
-if chip:
+if queued:
+    pending_text = queued
+elif chip:
     pending_text = chip
+    st.toast("에이블에게 물어봤어요! 💬 대화 탭에서 답변을 확인하세요.")
 elif typed and typed.strip():
     pending_text = typed.strip()
 elif send_voice and st.session_state.voice_text:
@@ -1468,6 +1835,19 @@ if st.session_state.deadline_changed:
     st.session_state.deadline_changed = False
     st.session_state.autoplay_last = True
     st.rerun()
+
+# ---------------------------------------------------------------
+# 방금 요약한 회의 → PDF 보고서 저장 / 미리보기
+# ---------------------------------------------------------------
+if st.session_state.last_summary_id is not None:
+    record = next((x for x in load_summaries() if x["id"] == st.session_state.last_summary_id), None)
+    if record:
+        with report_area:
+            c1, c2 = st.columns([3, 1.3])
+            c1.success(f"📝 회의 요약을 저장했습니다: {record['meeting_date']} {record['title']}")
+            pdf_download_button(record, key="pdf_latest", container=c2)
+            with st.expander("👁️ 요약 보고서(PDF) 미리보기"):
+                show_pdf_preview(record)
 
 # ---------------------------------------------------------------
 # 이메일 발송 전 확인 (사용자가 수정 후 발송 / 취소)
