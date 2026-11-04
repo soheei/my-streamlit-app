@@ -12,6 +12,7 @@ from email.utils import parseaddr
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from openai import OpenAI
 
 import calendar as pycal
@@ -29,6 +30,25 @@ CHAT_HEIGHT = 400      # 대화 영역 높이(px)
 MAX_HISTORY = 10       # LLM에 전달하는 대화 개수
 KEEP_AUDIO = 10        # 음성을 보관하는 최근 답변 개수
 RECENT_OPEN = 6        # 펼쳐 두는 최근 메시지 개수 (나머지는 접기)
+
+# 요청 버튼을 누르면 녹음 위젯의 '종료' 버튼을 대신 눌러 주는 스크립트 (부모 문서에 한 번만 등록)
+STOP_ON_SEND_JS = """
+<script>
+(function () {
+  var doc = window.parent.document;
+  if (window.parent.__ableStopOnSend) return;
+  window.parent.__ableStopOnSend = true;
+  doc.addEventListener('click', function (e) {
+    if (!e.target.closest('.st-key-voice_send button')) return;
+    var buttons = doc.querySelectorAll('[data-testid="stAudioInput"] button');
+    for (var i = 0; i < buttons.length; i++) {
+      var label = (buttons[i].getAttribute('aria-label') || buttons[i].title || '');
+      if (/stop/i.test(label)) { buttons[i].click(); break; }
+    }
+  }, true);
+})();
+</script>
+"""
 
 # ---------------------------------------------------------------
 # 키 읽어오기: 환경변수(Colab) 우선, 없으면 st.secrets(Streamlit Cloud)
@@ -920,6 +940,7 @@ defaults = {
     "recorder_key": 0,       # 녹음 위젯 초기화용
     "last_audio_hash": None, # 이미 인식한 녹음 (중복 인식 방지)
     "voice_text": None,      # 음성 인식 결과 (사용자가 확인하기 전까지 에이블에게 전달하지 않음)
+    "voice_armed": False,    # 녹음 중에 요청을 눌러, 녹음이 끝나면 바로 전달하도록 예약됨
     "quick_version": 0,      # 자주 쓰는 요청 편집기 초기화용
     "quick_base": [          # 자주 쓰는 요청 기본값
         "회의 내용을 요약해 줘.",
@@ -988,6 +1009,7 @@ with st.sidebar:
         st.session_state.email_draft = None
         st.session_state.last_audio_hash = None
         st.session_state.voice_text = None
+        st.session_state.voice_armed = False
         st.session_state.recorder_key += 1
         st.rerun()
 
@@ -1020,15 +1042,16 @@ with tab_chat:
             voice_slot = text_col.empty()   # 인식 중/결과/오류를 같은 자리에 한 줄로 표시 (레이아웃 고정)
             with cancel_col:
                 # 녹음 중이거나 녹음 후라도 위젯을 새로 만들어 녹음을 버린다 (에이블에게 전달되지 않음)
-                if st.button("❌ 취소", key="voice_cancel", use_container_width=True,
+                if st.button("❌", key="voice_cancel", use_container_width=True,
                              help="녹음을 취소합니다. 에이블에게 전달되지 않습니다."):
                     st.session_state.voice_text = None
+                    st.session_state.voice_armed = False
                     st.session_state.last_audio_hash = None
                     st.session_state.recorder_key += 1
                     st.rerun()
             with send_col:
                 # 항상 표시. 녹음이 끝났다면 인식이 덜 끝났어도 인식 후 바로 에이블에게 전달한다.
-                send_voice = st.button("✅ 요청", type="primary", key="voice_send", use_container_width=True,
+                send_voice = st.button("✅", type="primary", key="voice_send", use_container_width=True,
                                        help="녹음한 내용을 바로 에이블에게 전달합니다.")
             audio_file = st.audio_input("녹음 버튼을 눌러 말한 뒤, 다시 눌러 종료하세요.",
                                         key=f"recorder_{st.session_state.recorder_key}",
@@ -1047,15 +1070,22 @@ with tab_chat:
                         voice_error = str(e)
                     # 인식이 끝난 뒤에 처리 완료로 표시 (인식 도중 요청 버튼으로 재실행돼도 다시 인식함)
                     st.session_state.last_audio_hash = audio_hash
+                    if voice_error or not st.session_state.voice_text:
+                        st.session_state.voice_armed = False   # 인식 실패/빈 녹음은 전송하지 않음
+            # 녹음 중에 요청을 눌렀다면(아직 받은 녹음이 없음) 전송을 예약하고, 녹음이 끝나면 바로 전달
+            if send_voice and not st.session_state.voice_text:
+                st.session_state.voice_armed = True
             show_voice = st.session_state.voice_text is not None and audio_file is not None
             if voice_error:
                 voice_slot.caption(f"⚠️ 음성 인식 중 오류가 발생했습니다: {voice_error}")
-            elif send_voice and not st.session_state.voice_text:
-                voice_slot.caption("⚠️ 전달할 녹음이 없습니다. 먼저 녹음해 주세요.")
             elif show_voice:
                 voice_slot.caption(f"🎧 인식된 내용: {st.session_state.voice_text or '(인식된 내용이 없습니다)'}")
+            elif st.session_state.voice_armed:
+                voice_slot.caption("🎧 녹음을 마치는 대로 에이블에게 전달합니다...")
             else:
                 voice_slot.caption("🎧 녹음을 마치면 인식된 내용이 여기에 표시됩니다.")
+            # 요청 버튼을 누르면 진행 중인 녹음의 '종료' 버튼을 대신 눌러 준다 (종료 + 전송을 한 번에)
+            components.html(STOP_ON_SEND_JS, height=0)
 
 typed = st.chat_input("메시지를 입력하세요. (예: 회의 내용을 요약해 줘)")
 
@@ -1094,9 +1124,10 @@ if queued:
     pending_text = queued
 elif typed and typed.strip():
     pending_text = typed.strip()
-elif send_voice and st.session_state.voice_text:
+elif (send_voice or st.session_state.voice_armed) and st.session_state.voice_text:
     pending_text, pending_src = st.session_state.voice_text, "voice"
     st.session_state.voice_text = None
+    st.session_state.voice_armed = False
     st.session_state.last_audio_hash = None
     st.session_state.recorder_key += 1     # 다음 실행에서 녹음 위젯을 비움
 
