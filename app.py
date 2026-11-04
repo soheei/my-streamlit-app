@@ -15,6 +15,8 @@ import pandas as pd
 import streamlit as st
 from openai import OpenAI
 
+import time
+import streamlit.components.v1 as components
 import calendar as pycal
 from html import escape
 
@@ -1045,6 +1047,19 @@ def queue_request(text):
     """버튼(추천 질문, 업무 카드)을 누르면 에이블에게 보낼 요청으로 예약한다."""
     st.session_state.chip_request = text
 
+def ask_in_chat(text):
+    """우선순위 탭의 '묻기' 버튼: 요청을 예약하고 대화 탭으로 이동시킨다."""
+    queue_request(text)
+    st.session_state.go_chat = True
+
+def switch_to_chat_tab():
+    """st.tabs는 코드로 탭을 바꿀 수 없어, 브라우저에서 '대화' 탭 버튼을 대신 클릭한다."""
+    # 같은 내용이면 화면이 다시 실행되지 않으므로 매번 다른 값을 넣는다
+    components.html(
+        f"<script>/* {time.time()} */"
+        "const tabs = window.parent.document.querySelectorAll('button[role=\"tab\"]');"
+        "if (tabs.length) tabs[0].click();</script>", height=0)
+
 def briefing_text(tasks):
     """회의록을 올리면 에이블이 먼저 건네는 브리핑 메시지 (LLM 호출 없이 결과로 작성)."""
     if not tasks:
@@ -1076,8 +1091,10 @@ def render_priority_tab(tasks):
             with col:
                 with st.container(border=True):
                     # 제목은 고정, 업무 목록만 고정 높이 안에서 스크롤
-                    st.markdown(f"##### {q['icon']} {q['title']} · {len(items)}건")
-                    st.caption(f"→ {q['action']}")
+                    # 제목이 한 줄이든 두 줄이든 헤더 높이를 같게 맞춰 4칸의 전체 높이를 일정하게 유지
+                    st.markdown(f"<div style='height:3.2rem;font-size:1.1rem;font-weight:600;line-height:1.5;"
+                                f"overflow:hidden;'>{q['icon']} {q['title']}</div>", unsafe_allow_html=True)
+                    st.caption(f"→ {q['action']} · {len(items)}건")
                     with st.container(height=QUAD_HEIGHT):
                         if not items:
                             st.caption("해당 업무 없음")
@@ -1090,7 +1107,7 @@ def render_priority_tab(tasks):
                                          f"중요도 {'★' * t['importance']}{'☆' * (5 - t['importance'])}")
                             ask.button("🤖 묻기", key=f"pri_{q['order']}_{i}",
                                        help="에이블에게 시작 방법을 물어봅니다",
-                                       use_container_width=True, on_click=queue_request,
+                                       use_container_width=True, on_click=ask_in_chat,
                                        args=(f"'{t['task']}' 업무는 어떻게 시작하면 좋을지 단계별로 알려줘.",))
     with st.expander("📋 표로 보기 · 판단 근거"):
         st.dataframe(pd.DataFrame([{
@@ -1769,7 +1786,8 @@ if queued:
     pending_text = queued
 elif chip:
     pending_text = chip
-    st.toast("에이블에게 물어봤어요! 💬 대화 탭에서 답변을 확인하세요.")
+    if st.session_state.pop("go_chat", False):
+        switch_to_chat_tab()     # 답변이 만들어지기 전에 먼저 대화 탭으로 이동
 elif typed and typed.strip():
     pending_text = typed.strip()
 elif send_voice and st.session_state.voice_text:
