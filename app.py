@@ -1013,6 +1013,7 @@ with chat_col:
         st.markdown("<style>.st-key-voice_btns{gap:.5rem;}"
                     ".st-key-voice_btns button{min-height:0;height:1.9rem;padding:0 .5rem;}</style>",
                     unsafe_allow_html=True)
+        voice_slot = st.empty()   # 인식된 내용을 녹음 막대 위에 작은 글씨로 표시할 자리
         rec_col, btn_col = st.columns([5, 1])
         with btn_col:
             btns = st.container(key="voice_btns")
@@ -1034,8 +1035,7 @@ with chat_col:
                             st.error(f"음성 인식 중 오류가 발생했습니다: {e}")
             show_voice = st.session_state.voice_text is not None and audio_file is not None
             if show_voice:
-                st.caption("🎧 인식된 내용")
-                st.info(st.session_state.voice_text or "(인식된 내용이 없습니다)")
+                voice_slot.caption(f"🎧 인식된 내용: {st.session_state.voice_text or '(인식된 내용이 없습니다)'}")
         with btns:
             # 녹음 중이거나 녹음 후라도 위젯을 새로 만들어 녹음을 버린다 (에이블에게 전달되지 않음)
             if st.button("❌ 취소", key="voice_cancel",
