@@ -1022,20 +1022,26 @@ with chat_col:
                                         key=f"recorder_{st.session_state.recorder_key}",
                                         label_visibility="collapsed")
             # 새 녹음이 끝나면 인식 결과만 보여 주고, 사용자가 확인해야 에이블에게 전달
+            # 인식 중/결과/오류 모두 같은 자리(voice_slot)에 한 줄로 표시해 레이아웃이 움직이지 않게 함
+            voice_error = None
             if audio_file is not None:
                 audio_bytes = audio_file.getvalue()
                 audio_hash = hashlib.md5(audio_bytes).hexdigest()
                 if audio_hash != st.session_state.last_audio_hash:
                     st.session_state.last_audio_hash = audio_hash
-                    with st.spinner("음성 인식 중..."):
-                        try:
-                            st.session_state.voice_text = transcribe(audio_bytes).strip()
-                        except Exception as e:
-                            st.session_state.voice_text = None
-                            st.error(f"음성 인식 중 오류가 발생했습니다: {e}")
+                    voice_slot.caption("🎧 음성 인식 중...")
+                    try:
+                        st.session_state.voice_text = transcribe(audio_bytes).strip()
+                    except Exception as e:
+                        st.session_state.voice_text = None
+                        voice_error = str(e)
             show_voice = st.session_state.voice_text is not None and audio_file is not None
-            if show_voice:
+            if voice_error:
+                voice_slot.caption(f"⚠️ 음성 인식 중 오류가 발생했습니다: {voice_error}")
+            elif show_voice:
                 voice_slot.caption(f"🎧 인식된 내용: {st.session_state.voice_text or '(인식된 내용이 없습니다)'}")
+            else:
+                voice_slot.caption("🎧 녹음을 마치면 인식된 내용이 여기에 표시됩니다.")
         with btns:
             # 녹음 중이거나 녹음 후라도 위젯을 새로 만들어 녹음을 버린다 (에이블에게 전달되지 않음)
             if st.button("❌ 취소", key="voice_cancel",
