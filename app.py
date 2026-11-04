@@ -4,6 +4,7 @@ import json
 import ssl
 import hashlib
 import inspect
+import uuid
 import re
 import smtplib
 from concurrent.futures import ThreadPoolExecutor
@@ -461,9 +462,17 @@ def transcribe(audio_bytes):
 def speech_clean(text):
     """화면용 Markdown을 음성으로 읽기 좋은 문장으로 바꾼다 (표는 '머리글 값' 형태로 풀어 읽음)."""
     lines, header = [], None
-    for line in text.split("\n"):
+    raw_lines = text.split("\n")
+    for index, line in enumerate(raw_lines):
         s = line.strip()
-        if s.startswith("|") and s.endswith("|"):
+        if not s:
+            lines.append("")
+            continue
+        next_line = next((v.strip() for v in raw_lines[index + 1:] if v.strip()), "")
+        is_header = "|" in next_line and all(
+            re.fullmatch(r":?-+:?", c.strip()) for c in next_line.strip("|").split("|"))
+        if "|" in s and (header is not None or is_header or
+                         (s.startswith("|") and s.endswith("|"))):
             cells = [c.strip() for c in s.strip("|").split("|")]
             if all(not c or re.fullmatch(r":?-+:?", c) for c in cells):
                 continue    # 구분선, 빈 행
@@ -486,6 +495,8 @@ def speech_clean(text):
 
 def synthesize(text):
     text = speech_clean(text)
+    if not text:
+        return None
     chunks =[text[start:start + 3000] for start in range(0, len(text), 3000)]
 
     def speak(chunk):
@@ -511,6 +522,8 @@ def ask_able(user_text, history, meeting_text, recipient):
     available_tools = tools + deadline_tools + summary_tools + (confirm_tools if pending else [])
 
     for _ in range(5):  # 도구 호출은 최대 5회까지 (요약 저장, 일정 등록 등이 이어질 수 있음)
+        instructions = build_instructions(meeting_text, recipient, current_draft(),
+                                          st.session_state.deadlines)
         response = client.responses.create(
             model=MODEL, instructions=instructions, input=messages,
             tools=available_tools, parallel_tool_calls=False
@@ -759,12 +772,17 @@ def make_ics(deadlines):
     lines.append("END:VCALENDAR")
     return "\r\n".join(lines).encode("utf-8")
 
-def set_deadlines(items):
+def set_deadlines(items, refresh_editor=True):
     """도구로 바뀐 마감 일정을 저장하고 달력 탭의 편집기를 새 값으로 다시 그리게 한다."""
+    items = [{"id": uuid.uuid4().hex, "requester": "", "rush": False,
+              "importance": 3, "evidence": "", **item} for item in items]
     st.session_state.deadline_items = items
     st.session_state.deadlines = items
-    st.session_state.deadline_version += 1
-    st.session_state.deadline_changed = True
+    st.session_state.priority_items = classify_tasks(
+        [item for item in items if item["is_kim"]], today_kst())
+    if refresh_editor:
+        st.session_state.deadline_version += 1
+        st.session_state.deadline_changed = True
 
 def find_deadlines(keyword, items):
     key = clean(keyword).lower()
@@ -796,7 +814,7 @@ def add_deadline_tool(args):
                   "is_kim": bool(args.get("is_kim")), "due_text": "말/채팅으로 추가"})
     set_deadlines(items)
     # 마감이 없던 기존 업무에 날짜를 붙인 경우만 반영 (잘못 연결되지 않도록 기준을 높게)
-    synced = bool(args.get("is_kim")) and sync_priority(task, due, cutoff=0.7)
+    synced = bool(args.get("is_kim"))
     return {"status": "success", "task": task, "due_date": due.isoformat() if due else "날짜 미정",
             "priority_updated": bool(synced)}
 
@@ -823,9 +841,7 @@ def update_deadline_tool(args):
     items[items.index(target)] = updated
     set_deadlines(items)
     # 김 대리 업무면 우선순위 목록에도 반영
-    synced = updated["is_kim"] and sync_priority(
-        target["task"], updated["due"],
-        new_name=updated["task"] if updated["task"] != target["task"] else None)
+    synced = target["is_kim"] or updated["is_kim"]
     return {"status": "success", "task": updated["task"],
             "due_date": updated["due"].isoformat() if updated["due"] else "날짜 미정",
             "priority_updated": bool(synced)}
@@ -837,7 +853,7 @@ def delete_deadline_tool(args):
         return failed
     items.remove(target)
     set_deadlines(items)
-    synced = target["is_kim"] and sync_priority(target["task"], None)   # 업무는 남기고 마감만 '미정'으로
+    synced = target["is_kim"]  # 업무 삭제는 공통 목록과 두 탭에서 함께 제거
     return {"status": "success", "task": target["task"], "deleted": True,
             "priority_updated": bool(synced)}
 
@@ -873,6 +889,13 @@ TASK_SCHEMA = {
     "additionalProperties": False,
 }
 
+# 달력과 우선순위가 같은 추출 결과를 사용한다.
+TASK_SCHEMA["properties"]["items"]["items"]["properties"].update({
+    "assignee": {"type": "string", "description": "담당자. 없으면 빈 문자열"},
+    "is_kim": {"type": "boolean", "description": "김 대리에게 배정된 업무 여부"},
+})
+TASK_SCHEMA["properties"]["items"]["items"]["required"] += ["assignee", "is_kim"]
+
 # 4분면 정의: (긴급, 중요) → 슬라이드 문구
 QUADRANTS = {
     (True, True):   {"order": 1, "icon": "🔥", "title": "긴급하고 중요한 일", "action": "즉시 직접 처리"},
@@ -882,9 +905,10 @@ QUADRANTS = {
 }
 
 def extract_tasks(meeting_text, base_date):
-    """① LLM: 김 대리 업무를 마감 유무와 상관없이 모두 추출하고 중요도를 판단한다."""
+    """한 번의 LLM 분석으로 두 탭의 공통 업무와 중요도를 추출한다."""
     instructions = f"""
-회의록에서 김 대리(김대리)에게 배정된 업무를 마감 유무와 상관없이 모두 찾아 구조화하세요.
+회의록에서 모든 담당자의 업무를 마감 유무와 상관없이 찾아 구조화하세요.
+assignee에는 담당자 이름을 쓰고 김 대리(김대리) 업무는 is_kim을 true로 쓰세요.
 다른 사람이 김 대리에게 전달하기로 한 업무도 포함합니다. 같은 업무가 여러 번 언급되면 하나로 합치세요.
 회의 날짜는 {fmt_day(base_date)} 입니다. 상대적인 기한은 직접 계산하지 말고 아래 날짜 참고표에서 찾아 YYYY-MM-DD로 쓰세요.
 '다음 주까지'처럼 요일이 없으면 그 주 금요일로 쓰세요. 기한이 없거나 정할 수 없으면 due_date는 null입니다.
@@ -914,6 +938,9 @@ evidence: 판단에 쓴 회의록 발언을 '이름: 발언' 형식으로 짧게
         items.append({
             "task": item["task"].strip(),
             "requester": item["requester"].strip(),
+            "id": uuid.uuid4().hex,
+            "assignee": item["assignee"].strip(),
+            "is_kim": bool(item["is_kim"]),
             "due": parse_date(item["due_date"]),
             "due_text": item["due_text"].strip(),
             "rush": bool(item["rush"]),
@@ -1425,9 +1452,6 @@ CAL_CSS = (
     "</style>"
 )
 
-# ---------------------------------------------------------------
-# 달력 우선순위 색: 마감 일정을 우선순위(아이젠하워 4분면)와 연결해 색으로 구분
-# ---------------------------------------------------------------
 PRIORITY_COLORS = {
     1: {"cls": "p1", "color": "#E5484D"},   # 🔥 긴급하고 중요한 일
     2: {"cls": "p2", "color": "#3E63DD"},   # 📅 긴급하지 않지만 중요한 일
@@ -1474,7 +1498,7 @@ def pill_style(d, priority_items):
     """달력 칸에 표시할 업무의 (CSS 클래스, 앞에 붙일 아이콘, 마우스를 올렸을 때 설명)."""
     if not d["is_kim"]:
         return "etc", "", "그 외 업무"
-    p = match_priority(d["task"], priority_items)
+    p = next((p for p in priority_items if p["id"] == d["id"]), None)
     if p:
         q = p["quadrant"]
         return PRIORITY_COLORS[q["order"]]["cls"], q["icon"] + " ", quadrant_label(q)
@@ -1489,6 +1513,7 @@ def priority_legend_html():
     items.append("<span><i style='background:#12A594'></i>김 대리 업무 (분류 전)</span>")
     items.append("<span><i style='border:1px solid rgba(128,128,128,.7)'></i>그 외 업무</span>")
     return "<div class='able-legend'>" + "".join(items) + "</div>"
+
 
 def month_grid_html(year, month, dated, today, max_items=3, priority_items=None):
     """표준 라이브러리(calendar)로 만든 월간 달력. 일정이 있는 날짜 칸에 업무를 표시한다."""
@@ -1526,6 +1551,7 @@ def render_deadline_tab():
     st.markdown("##### ✏️ 마감 일정 목록 (수정 · 추가 · 삭제 가능)")
     st.caption("AI가 찾은 결과는 틀릴 수 있어요. 표에서 직접 고치면 달력과 에이블의 답변에 바로 반영됩니다.")
     df = pd.DataFrame({
+        "id": [i["id"] for i in items],
         "업무": [i["task"] for i in items],
         "담당자": [i["assignee"] for i in items],
         "마감일": pd.to_datetime([i["due"] for i in items]),
@@ -1536,18 +1562,21 @@ def render_deadline_tab():
         df, num_rows="dynamic", hide_index=True, use_container_width=True,
         key=f"deadline_editor_{version}",
         column_config={
+            "id": None,
             "마감일": st.column_config.DateColumn("마감일", format="YYYY-MM-DD"),
             "김 대리 업무": st.column_config.CheckboxColumn("김 대리 업무"),
         },
     )
 
     deadlines = []
+    original_by_id = {i["id"]: i for i in items}
     for row in edited.to_dict("records"):
         task = clean(row.get("업무"))
         if not task:
             continue
         flag = row.get("김 대리 업무")
         deadlines.append({
+            **original_by_id.get(clean(row.get("id")), {}),
             "task": task,
             "assignee": clean(row.get("담당자")),
             "due": parse_date(row.get("마감일")),
@@ -1555,6 +1584,13 @@ def render_deadline_tab():
             "due_text": clean(row.get("원문 표현")),
         })
 
+    changed = deadlines != items
+    set_deadlines(deadlines, refresh_editor=False)
+    deadlines = st.session_state.deadlines
+    if changed:
+        # 새 행의 ID를 포함한 목록을 다음 실행의 편집기 초기값으로 사용한다.
+        st.session_state.deadline_version += 1
+        st.rerun()
     dated = [d for d in deadlines if d["due"]]
     undated = [d for d in deadlines if not d["due"]]
     today = today_kst()
@@ -1623,6 +1659,8 @@ defaults = {
     "draft_id": 0,
     "recorder_key": 0,       # 녹음 위젯 초기화용
     "last_audio_hash": None, # 이미 인식한 녹음 (중복 인식 방지)
+    "voice_audio": None,     # 종료된 녹음을 위젯과 별도로 보관
+    "voice_error": None,
     "voice_text": None,      # 음성 인식 결과 (사용자가 확인하기 전까지 에이블에게 전달하지 않음)
 }
 for key, value in defaults.items():
@@ -1666,6 +1704,8 @@ with st.sidebar:
         st.session_state.last_summary_id = None
         st.session_state.last_audio_hash = None
         st.session_state.voice_text = None
+        st.session_state.voice_audio = None
+        st.session_state.voice_error = None
         st.session_state.recorder_key += 1
         st.rerun()
 
@@ -1684,6 +1724,8 @@ with head_right:
 
 # 최신 버전은 공식 상태 제어를 사용하고, 구버전은 아래의 브라우저 이동을 사용한다.
 supports_tab_state = {"key", "on_change"}.issubset(inspect.signature(st.tabs).parameters)
+if st.session_state.pop("chat_navigation", False):
+    st.session_state.main_tabs = "💬 대화"
 tab_options = {"key": "main_tabs", "on_change": "rerun"} if supports_tab_state else {}
 tab_chat, tab_pri, tab_rec, tab_cal = st.tabs(
     ["💬 대화", "🎯 우선순위", "🗂️ 회의 기록", "📅 마감 달력"], **tab_options)
@@ -1701,53 +1743,54 @@ with tab_chat:
         col.button(f"{icon} {text}", key=f"quick_{text}", on_click=queue_request,
                    args=(text,), use_container_width=True)
 
-    send_voice = False
-    with st.expander("🎤 음성으로 요청하기 (녹음 후 인식된 내용을 확인하고 보내세요)", expanded=True):
-        st.markdown("<style>.st-key-voice_wrap{gap:.4rem;}</style>", unsafe_allow_html=True)
-        with st.container(key="voice_wrap"):
-            # 위 줄: [취소][요청] 인식된 내용 (버튼은 붙여서) / 아래 줄: 녹음 막대
-            cancel_col, send_col, text_col = st.columns([1, 1, 15], gap="small", vertical_alignment="center")
-            voice_slot = text_col.empty()   # 인식 중/결과/오류를 같은 자리에 한 줄로 표시 (레이아웃 고정)
-            with cancel_col:
-                # 녹음 중이거나 녹음 후라도 위젯을 새로 만들어 녹음을 버린다 (에이블에게 전달되지 않음)
-                if st.button("❌", key="voice_cancel", use_container_width=True,
-                             help="녹음을 취소합니다. 에이블에게 전달되지 않습니다."):
-                    st.session_state.voice_text = None
-                    st.session_state.last_audio_hash = None
-                    st.session_state.recorder_key += 1
-                    st.rerun()
-            with send_col:
-                # 녹음을 직접 종료해 인식된 내용이 있을 때만 전달된다.
-                send_voice = st.button("✅", key="voice_send", use_container_width=True,
-                                       help="인식된 내용을 에이블에게 전달합니다. 녹음을 먼저 종료하세요.")
-            audio_file = st.audio_input("녹음 버튼을 눌러 말한 뒤, 다시 눌러 종료하세요.",
-                                        key=f"recorder_{st.session_state.recorder_key}",
-                                        label_visibility="collapsed")
-            # 새 녹음이 끝나면 인식 결과만 보여 주고, 사용자가 확인해야 에이블에게 전달
-            voice_error = None
-            if audio_file is not None:
-                audio_bytes = audio_file.getvalue()
-                audio_hash = hashlib.md5(audio_bytes).hexdigest()
-                if audio_hash != st.session_state.last_audio_hash:
-                    voice_slot.caption("🎧 음성 인식 중...")
-                    try:
-                        st.session_state.voice_text = transcribe(audio_bytes).strip()
-                    except Exception as e:
-                        st.session_state.voice_text = None
-                        voice_error = str(e)
-                    # 인식이 끝난 뒤에 처리 완료로 표시
-                    st.session_state.last_audio_hash = audio_hash
-            show_voice = st.session_state.voice_text is not None and audio_file is not None
-            if voice_error:
-                voice_slot.caption(f"⚠️ 음성 인식 중 오류가 발생했습니다: {voice_error}")
-            elif show_voice:
-                voice_slot.caption(f"🎧 인식된 내용: {st.session_state.voice_text or '(인식된 내용이 없습니다)'}")
-            elif send_voice:
-                voice_slot.caption("⚠️ 녹음을 먼저 종료해 인식된 내용을 확인하세요.")
-            else:
-                voice_slot.caption("🎧 녹음을 마치면 인식된 내용이 여기에 표시됩니다.")
+# Shared input is outside tab containers, so it stays visible on every tab.
+if "accept_audio" not in inspect.signature(st.chat_input).parameters:
+    st.error("Streamlit 1.52 이상으로 업데이트해 주세요: pip install -U streamlit")
+    st.stop()
+if "input_draft" in st.session_state:
+    st.session_state.unified_input = st.session_state.pop("input_draft")
+submission = st.chat_input(
+    "메시지를 입력하거나 마이크로 녹음하세요. 녹음은 인식 후 확인하여 전송합니다.",
+    key="unified_input", accept_audio=True)
+if submission is not None:
+    if submission.audio is not None:
+        st.session_state.voice_audio = submission.audio.getvalue()
+        st.session_state.voice_error = None
+        st.session_state.voice_text = None
+        st.session_state.voice_prefix = submission.text.strip()
+    elif submission.text.strip():
+        queue_request(submission.text.strip())
+        st.session_state.go_chat = True
+        st.session_state.chat_navigation = True
+        st.session_state.voice_audio = None
+        st.session_state.voice_error = None
+        st.session_state.voice_text = None
+        st.rerun()
 
-typed = st.chat_input("메시지를 입력하세요. (예: 회의 내용을 요약해 줘)")
+if st.session_state.voice_audio:
+    retry_voice = False
+    if st.session_state.voice_error:
+        st.warning(f"음성 인식 오류: {st.session_state.voice_error}")
+        retry_voice = st.button("🔄 음성 인식 다시 시도", key="voice_retry")
+    if st.button("❌ 녹음 취소", key="voice_cancel"):
+        st.session_state.voice_audio = None
+        st.session_state.voice_error = None
+        st.rerun()
+    if not st.session_state.voice_error or retry_voice:
+        try:
+            with st.spinner("음성을 텍스트로 변환하는 중..."):
+                recognized = transcribe(st.session_state.voice_audio).strip()
+            if not recognized:
+                raise ValueError("인식된 내용이 없습니다. 다시 녹음해 주세요.")
+            prefix = st.session_state.pop("voice_prefix", "")
+            st.session_state.input_draft = "\n".join(v for v in (prefix, recognized) if v)
+            st.session_state.voice_audio = None
+            st.session_state.voice_error = None
+            st.rerun()
+        except Exception as e:
+            st.session_state.voice_error = str(e)
+            st.rerun()
+
 
 with tab_rec:
     render_records_tab(recipient)
@@ -1755,24 +1798,26 @@ with tab_rec:
 # ---------------------------------------------------------------
 # 마감 달력 탭: 회의록이 바뀌면 마감 일정을 다시 추출 (에이블 답변보다 먼저 실행해 목록을 반영)
 # ---------------------------------------------------------------
-# ---------------------------------------------------------------
-# 우선순위 탭: 회의록이 바뀔 때만 다시 분류 (버튼을 누를 때마다 LLM을 부르지 않도록)
-# ---------------------------------------------------------------
 if meeting_text:
     priority_key = hashlib.md5(f"{meeting_text}|{meeting_date}".encode()).hexdigest()
-    if st.session_state.priority_key != priority_key:
+    if st.session_state.priority_key != priority_key or st.session_state.deadline_key is None:
         with st.spinner("에이블이 업무 우선순위를 정리하는 중..."):
             try:
                 items = extract_tasks(meeting_text, meeting_date)
-                st.session_state.priority_items = classify_tasks(items, today_kst())                # 회의록을 새로 올리면 에이블이 먼저 말을 건넴 (챗봇다운 첫인사)
+                set_deadlines(items)
+                st.session_state.deadline_changed = False
+                st.session_state.deadline_key = priority_key
+                # 회의록을 새로 올리면 에이블이 먼저 말을 건넴 (챗봇다운 첫인사)
                 add_message(role="assistant", content=briefing_text(st.session_state.priority_items))
             except Exception as e:
                 st.session_state.priority_items = []
                 st.error(f"우선순위 분류 중 오류가 발생했습니다: {e}")
-        st.session_state.priority_key = priority_key
+            else:
+                st.session_state.priority_key = priority_key
 else:
-    st.session_state.priority_items = []
     st.session_state.priority_key = None
+
+set_deadlines(st.session_state.deadline_items, refresh_editor=False)
 
 with tab_cal:
     if not meeting_text and not st.session_state.deadline_items:
@@ -1782,19 +1827,13 @@ with tab_cal:
                 "에이블에게 \"다음 주 금요일에 ○○ 마감 표시해줘\"라고 말해도 됩니다.")
     elif meeting_text:
         deadline_key = hashlib.md5(f"{meeting_text}|{meeting_date}".encode()).hexdigest()
-        if st.session_state.deadline_key != deadline_key:
-            with st.spinner("회의록에서 마감 일정을 찾는 중..."):
-                try:
-                    st.session_state.deadline_items = extract_deadlines(meeting_text, meeting_date)
-                except Exception as e:
-                    st.session_state.deadline_items = []
-                    st.error(f"마감 일정 추출 중 오류가 발생했습니다: {e}")
-            st.session_state.deadline_key = deadline_key
-            st.session_state.deadline_version += 1
         st.caption(f"회의 날짜 {meeting_date.isoformat()} 기준으로 상대적인 기한을 계산했습니다.")
     if meeting_text or st.session_state.deadline_items:
         st.session_state.deadlines = render_deadline_tab()
 
+# ---------------------------------------------------------------
+# 우선순위 탭: 회의록이 바뀔 때만 다시 분류 (버튼을 누를 때마다 LLM을 부르지 않도록)
+# ---------------------------------------------------------------
 with tab_pri:
     if st.session_state.priority_items:
         render_priority_tab(st.session_state.priority_items)
@@ -1812,13 +1851,6 @@ if chip:
     pending_text = chip
     if st.session_state.pop("go_chat", False) and not supports_tab_state:
         switch_to_chat_tab()     # 답변이 만들어지기 전에 먼저 대화 탭으로 이동
-elif typed and typed.strip():
-    pending_text = typed.strip()
-elif send_voice and st.session_state.voice_text:
-    pending_text, pending_src = st.session_state.voice_text, "voice"
-    st.session_state.voice_text = None
-    st.session_state.last_audio_hash = None
-    st.session_state.recorder_key += 1     # 다음 실행에서 녹음 위젯을 비움
 
 # ---------------------------------------------------------------
 # 대화 영역: 기존 대화 출력 + 새 요청 처리
@@ -1871,14 +1903,24 @@ with chat_area:
                         f"받는 사람은 {new_draft['to']}, 제목은 {new_draft['subject']}입니다. "
                         f"본문입니다. {new_draft['body']}"
                     )
-                audio = synthesize(speech_text)
+                try:
+                    audio = synthesize(speech_text)
+                except Exception as e:
+                    audio = None
+                    st.warning(f"음성 변환에 실패했습니다. 텍스트로 답변을 표시합니다: {e}")
 
             # 음성 지시로 발송/취소된 경우 결과 줄을 먼저 표시
             for m in st.session_state.messages[n_before:]:
                 render_message(m)
             answer_msg = add_message(role="assistant", content=answer, audio=audio)
             prune_audio()
-            render_message(answer_msg, show_text, autoplay=True)
+            render_message(answer_msg, show_text or not audio, autoplay=True)
+            if src == "voice":
+                st.session_state.voice_text = None
+                st.session_state.voice_audio = None
+                st.session_state.voice_error = None
+                st.session_state.last_audio_hash = None
+                st.session_state.recorder_key += 1
         except Exception as e:
             st.error(f"오류가 발생했습니다: {e}")
 
@@ -1936,4 +1978,3 @@ with download_area:
         file_name="able_chat.txt", mime="text/plain",
         use_container_width=True, disabled=not st.session_state.messages,
     )
-
