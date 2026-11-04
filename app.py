@@ -21,6 +21,7 @@ import time
 import streamlit.components.v1 as components
 import calendar as pycal
 from html import escape
+from difflib import SequenceMatcher
 
 # PDF 보고서 (reportlab: PDF 만들기 / pypdfium2: 화면 미리보기)
 import io
@@ -49,7 +50,7 @@ st.set_page_config(page_title="AI 개인비서 에이블", page_icon="🤖", lay
 ROBOT_URL = "https://raw.githubusercontent.com/Jangrae/img/master/ai_robot.png"
 USER_AVATAR = "🧑‍💼"
 ROBOT_AVATAR = "🤖"    # 채팅 아바타 (이미지는 잘려 보여 이모지 사용)
-CHAT_HEIGHT = 400      # 대화 영역 높이(px)
+CHAT_HEIGHT = 500      # 대화 영역 높이(px)
 MAX_HISTORY = 10       # LLM에 전달하는 대화 개수
 KEEP_AUDIO = 10        # 음성을 보관하는 최근 답변 개수
 QUAD_HEIGHT = 300      # 우선순위 4분면 각 칸의 업무 목록 높이(px), 넘치면 스크롤
@@ -460,17 +461,9 @@ def transcribe(audio_bytes):
 def speech_clean(text):
     """화면용 Markdown을 음성으로 읽기 좋은 문장으로 바꾼다 (표는 '머리글 값' 형태로 풀어 읽음)."""
     lines, header = [], None
-    raw_lines = text.split("\n")
-    for index, line in enumerate(raw_lines):
+    for line in text.split("\n"):
         s = line.strip()
-        if not s:
-            lines.append("")
-            continue
-        next_line = next((v.strip() for v in raw_lines[index + 1:] if v.strip()), "")
-        is_header = "|" in next_line and all(
-            re.fullmatch(r":?-+:?", c.strip()) for c in next_line.strip("|").split("|"))
-        if "|" in s and (header is not None or is_header or
-                         (s.startswith("|") and s.endswith("|"))):
+        if s.startswith("|") and s.endswith("|"):
             cells = [c.strip() for c in s.strip("|").split("|")]
             if all(not c or re.fullmatch(r":?-+:?", c) for c in cells):
                 continue    # 구분선, 빈 행
@@ -493,8 +486,6 @@ def speech_clean(text):
 
 def synthesize(text):
     text = speech_clean(text)
-    if not text:
-        return None
     chunks =[text[start:start + 3000] for start in range(0, len(text), 3000)]
 
     def speak(chunk):
@@ -804,7 +795,10 @@ def add_deadline_tool(args):
     items.append({"task": task, "assignee": clean(args.get("assignee")), "due": due,
                   "is_kim": bool(args.get("is_kim")), "due_text": "말/채팅으로 추가"})
     set_deadlines(items)
-    return {"status": "success", "task": task, "due_date": due.isoformat() if due else "날짜 미정"}
+    # 마감이 없던 기존 업무에 날짜를 붙인 경우만 반영 (잘못 연결되지 않도록 기준을 높게)
+    synced = bool(args.get("is_kim")) and sync_priority(task, due, cutoff=0.7)
+    return {"status": "success", "task": task, "due_date": due.isoformat() if due else "날짜 미정",
+            "priority_updated": bool(synced)}
 
 def update_deadline_tool(args):
     items = list(st.session_state.deadlines)
@@ -828,8 +822,13 @@ def update_deadline_tool(args):
         updated["is_kim"] = bool(args.get("is_kim"))
     items[items.index(target)] = updated
     set_deadlines(items)
+    # 김 대리 업무면 우선순위 목록에도 반영
+    synced = updated["is_kim"] and sync_priority(
+        target["task"], updated["due"],
+        new_name=updated["task"] if updated["task"] != target["task"] else None)
     return {"status": "success", "task": updated["task"],
-            "due_date": updated["due"].isoformat() if updated["due"] else "날짜 미정"}
+            "due_date": updated["due"].isoformat() if updated["due"] else "날짜 미정",
+            "priority_updated": bool(synced)}
 
 def delete_deadline_tool(args):
     items = list(st.session_state.deadlines)
@@ -838,7 +837,9 @@ def delete_deadline_tool(args):
         return failed
     items.remove(target)
     set_deadlines(items)
-    return {"status": "success", "task": target["task"], "deleted": True}
+    synced = target["is_kim"] and sync_priority(target["task"], None)   # 업무는 남기고 마감만 '미정'으로
+    return {"status": "success", "task": target["task"], "deleted": True,
+            "priority_updated": bool(synced)}
 
 # ---------------------------------------------------------------
 # 업무 우선순위 (아이젠하워 매트릭스)
@@ -1412,12 +1413,84 @@ CAL_CSS = (
     ".able-cal .num{font-size:12px;opacity:.8;margin-bottom:2px;}"
     ".able-cal .pill{font-size:11px;color:#fff;border-radius:4px;padding:1px 5px;margin-bottom:2px;"
     "white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}"
-    ".able-cal .kim{background:#e5484d;}.able-cal .etc{background:#4f7cff;}"
+    # 우선순위 색: 1 빨강(긴급·중요) · 2 파랑(중요) · 3 주황(긴급) · 4 회색(둘 다 아님)
+    ".able-cal .p1{background:#E5484D;}.able-cal .p2{background:#3E63DD;}"
+    ".able-cal .p3{background:#F76B15;}.able-cal .p4{background:#8B8D98;}"
+    ".able-cal .kim{background:#12A594;}"   # 김 대리 업무지만 우선순위 분류 전
+    ".able-cal .etc{background:transparent;color:inherit;border:1px solid rgba(128,128,128,.55);opacity:.75;}"
+    ".able-legend{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:12px;margin:6px 0 2px;}"
+    ".able-legend span{display:inline-flex;align-items:center;gap:5px;}"
+    ".able-legend i{width:12px;height:12px;border-radius:3px;display:inline-block;}"
     ".able-cal .more{font-size:11px;opacity:.7;}"
     "</style>"
 )
 
-def month_grid_html(year, month, dated, today, max_items=3):
+# ---------------------------------------------------------------
+# 달력 우선순위 색: 마감 일정을 우선순위(아이젠하워 4분면)와 연결해 색으로 구분
+# ---------------------------------------------------------------
+PRIORITY_COLORS = {
+    1: {"cls": "p1", "color": "#E5484D"},   # 🔥 긴급하고 중요한 일
+    2: {"cls": "p2", "color": "#3E63DD"},   # 📅 긴급하지 않지만 중요한 일
+    3: {"cls": "p3", "color": "#F76B15"},   # ⏱️ 긴급하지만 중요하지 않은 일
+    4: {"cls": "p4", "color": "#8B8D98"},   # 🧹 긴급하지도 중요하지도 않은 일
+}
+
+def quadrant_label(q):
+    """4분면 이름 (비서 말투 이름 'report'가 있으면 그것을, 없으면 기본 이름 'title'을 사용)."""
+    return q.get("report") or q["title"]
+
+def norm_task(text):
+    """업무 이름 비교용: 띄어쓰기·기호를 없앤다."""
+    return re.sub(r"[\s·,./()\-'\"]", "", text or "")
+
+def match_priority(task, priority_items, cutoff=0.5):
+    """마감 일정의 업무 이름과 가장 비슷한 우선순위 업무를 찾는다.
+    (마감 추출과 우선순위 추출은 따로 이뤄져서 업무 이름 표현이 조금 다를 수 있음)"""
+    a = norm_task(task)
+    best, best_score = None, 0.0
+    for p in priority_items:
+        b = norm_task(p["task"])
+        score = SequenceMatcher(None, a, b).ratio()
+        if a and b and (a in b or b in a):      # 한쪽 이름이 다른 쪽에 포함되면 같은 업무로 봄
+            score = max(score, 0.9)
+        if score > best_score:
+            best, best_score = p, score
+    return best if best_score >= cutoff else None
+
+def sync_priority(name, due, new_name=None, cutoff=0.5):
+    """달력에서 바뀐 마감일을 우선순위 목록에도 반영하고 다시 분류한다 (LLM 호출 없음).
+    달력 색과 같은 match_priority로 찾으므로, 색이 칠해진 업무와 같은 업무가 바뀐다."""
+    tasks = st.session_state.get("priority_items", [])
+    target = match_priority(name, tasks, cutoff)
+    if target is None:
+        return False
+    target["due"] = due
+    if new_name:
+        target["task"] = new_name
+    st.session_state.priority_items = classify_tasks(tasks, today_kst())
+    return True
+
+def pill_style(d, priority_items):
+    """달력 칸에 표시할 업무의 (CSS 클래스, 앞에 붙일 아이콘, 마우스를 올렸을 때 설명)."""
+    if not d["is_kim"]:
+        return "etc", "", "그 외 업무"
+    p = match_priority(d["task"], priority_items)
+    if p:
+        q = p["quadrant"]
+        return PRIORITY_COLORS[q["order"]]["cls"], q["icon"] + " ", quadrant_label(q)
+    return "kim", "", "김 대리 업무 (우선순위 분류 전)"
+
+def priority_legend_html():
+    """달력 아래 범례: 색 + 아이콘 + 이름 (색만으로 구분하지 않도록 아이콘도 함께 표시)."""
+    items = []
+    for key, q in sorted(QUADRANTS.items(), key=lambda kv: kv[1]["order"]):
+        color = PRIORITY_COLORS[q["order"]]["color"]
+        items.append(f"<span><i style='background:{color}'></i>{q['icon']} {quadrant_label(q)}</span>")
+    items.append("<span><i style='background:#12A594'></i>김 대리 업무 (분류 전)</span>")
+    items.append("<span><i style='border:1px solid rgba(128,128,128,.7)'></i>그 외 업무</span>")
+    return "<div class='able-legend'>" + "".join(items) + "</div>"
+
+def month_grid_html(year, month, dated, today, max_items=3, priority_items=None):
     """표준 라이브러리(calendar)로 만든 월간 달력. 일정이 있는 날짜 칸에 업무를 표시한다."""
     by_day = {}
     for d in dated:
@@ -1428,10 +1501,14 @@ def month_grid_html(year, month, dated, today, max_items=3):
         cells = []
         for day in week:
             cls = ("other " if day.month != month else "") + ("today" if day == today else "")
-            items = by_day.get(day, [])
+            styled = [(d, *pill_style(d, priority_items or [])) for d in by_day.get(day, [])]
+            # 한 칸에 여러 업무가 있으면 우선순위가 높은 것부터 보이게 (p1 → p4 → 분류 전 → 그 외)
+            rank = {"p1": 1, "p2": 2, "p3": 3, "p4": 4, "kim": 5, "etc": 6}
+            styled.sort(key=lambda x: rank[x[1]])
+            items = styled
             pills = "".join(
-                f"<div class='pill {'kim' if d['is_kim'] else 'etc'}' title='{escape(d['task'])}'>"
-                f"{escape(d['task'])}</div>" for d in items[:max_items])
+                f"<div class='pill {cls}' title='{escape(label)} · {escape(d['task'])}'>"
+                f"{icon}{escape(d['task'])}</div>" for d, cls, icon, label in items[:max_items])
             more = f"<div class='more'>+{len(items) - max_items}건 더</div>" if len(items) > max_items else ""
             cells.append(f"<td class='{cls.strip()}'><div class='num'>{day.day}</div>{pills}{more}</td>")
         rows.append("<tr>" + "".join(cells) + "</tr>")
@@ -1510,8 +1587,10 @@ def render_deadline_tab():
             n3.markdown(f"<div style='text-align:center;font-size:1.3rem;font-weight:700;padding-top:4px'>"
                         f"{month.year}년 {month.month}월</div>", unsafe_allow_html=True)
             n4.button("다음 달 ▶", on_click=shift_month, args=(1,), use_container_width=True)
-            st.markdown(month_grid_html(month.year, month.month, dated, today), unsafe_allow_html=True)
-            st.caption("🔴 김 대리 업무 · 🔵 그 외 업무")
+            st.markdown(month_grid_html(month.year, month.month, dated, today,
+                                        priority_items=st.session_state.get("priority_items", [])),
+                        unsafe_allow_html=True)
+            st.markdown(CAL_CSS + priority_legend_html(), unsafe_allow_html=True)
 
     if undated:
         st.warning("📌 날짜 미정: " + " / ".join(d["task"] for d in undated))
@@ -1544,8 +1623,6 @@ defaults = {
     "draft_id": 0,
     "recorder_key": 0,       # 녹음 위젯 초기화용
     "last_audio_hash": None, # 이미 인식한 녹음 (중복 인식 방지)
-    "voice_audio": None,     # 종료된 녹음을 위젯과 별도로 보관
-    "voice_error": None,
     "voice_text": None,      # 음성 인식 결과 (사용자가 확인하기 전까지 에이블에게 전달하지 않음)
 }
 for key, value in defaults.items():
@@ -1589,8 +1666,6 @@ with st.sidebar:
         st.session_state.last_summary_id = None
         st.session_state.last_audio_hash = None
         st.session_state.voice_text = None
-        st.session_state.voice_audio = None
-        st.session_state.voice_error = None
         st.session_state.recorder_key += 1
         st.rerun()
 
@@ -1638,8 +1713,6 @@ with tab_chat:
                 if st.button("❌", key="voice_cancel", use_container_width=True,
                              help="녹음을 취소합니다. 에이블에게 전달되지 않습니다."):
                     st.session_state.voice_text = None
-                    st.session_state.voice_audio = None
-                    st.session_state.voice_error = None
                     st.session_state.last_audio_hash = None
                     st.session_state.recorder_key += 1
                     st.rerun()
@@ -1651,32 +1724,22 @@ with tab_chat:
                                         key=f"recorder_{st.session_state.recorder_key}",
                                         label_visibility="collapsed")
             # 새 녹음이 끝나면 인식 결과만 보여 주고, 사용자가 확인해야 에이블에게 전달
+            voice_error = None
             if audio_file is not None:
                 audio_bytes = audio_file.getvalue()
-                if audio_bytes != st.session_state.voice_audio:
-                    st.session_state.voice_audio = audio_bytes
-                    st.session_state.voice_text = None
-                    st.session_state.voice_error = None
-            retry_voice = False
-            if st.session_state.voice_error:
-                retry_voice = st.button("🔄 음성 인식 다시 시도", key="voice_retry")
-            audio_bytes = st.session_state.voice_audio
-            if audio_bytes and (not st.session_state.voice_error or retry_voice):
                 audio_hash = hashlib.md5(audio_bytes).hexdigest()
                 if audio_hash != st.session_state.last_audio_hash:
                     voice_slot.caption("🎧 음성 인식 중...")
                     try:
                         st.session_state.voice_text = transcribe(audio_bytes).strip()
-                        if not st.session_state.voice_text:
-                            raise ValueError("인식된 내용이 없습니다. 재시도하거나 다시 녹음하세요.")
-                        st.session_state.last_audio_hash = audio_hash
-                        st.session_state.voice_error = None
                     except Exception as e:
                         st.session_state.voice_text = None
-                        st.session_state.voice_error = str(e)
-            show_voice = st.session_state.voice_text is not None
-            if st.session_state.voice_error:
-                voice_slot.caption(f"⚠️ 음성 인식 중 오류가 발생했습니다: {st.session_state.voice_error}")
+                        voice_error = str(e)
+                    # 인식이 끝난 뒤에 처리 완료로 표시
+                    st.session_state.last_audio_hash = audio_hash
+            show_voice = st.session_state.voice_text is not None and audio_file is not None
+            if voice_error:
+                voice_slot.caption(f"⚠️ 음성 인식 중 오류가 발생했습니다: {voice_error}")
             elif show_voice:
                 voice_slot.caption(f"🎧 인식된 내용: {st.session_state.voice_text or '(인식된 내용이 없습니다)'}")
             elif send_voice:
@@ -1692,6 +1755,25 @@ with tab_rec:
 # ---------------------------------------------------------------
 # 마감 달력 탭: 회의록이 바뀌면 마감 일정을 다시 추출 (에이블 답변보다 먼저 실행해 목록을 반영)
 # ---------------------------------------------------------------
+# ---------------------------------------------------------------
+# 우선순위 탭: 회의록이 바뀔 때만 다시 분류 (버튼을 누를 때마다 LLM을 부르지 않도록)
+# ---------------------------------------------------------------
+if meeting_text:
+    priority_key = hashlib.md5(f"{meeting_text}|{meeting_date}".encode()).hexdigest()
+    if st.session_state.priority_key != priority_key:
+        with st.spinner("에이블이 업무 우선순위를 정리하는 중..."):
+            try:
+                items = extract_tasks(meeting_text, meeting_date)
+                st.session_state.priority_items = classify_tasks(items, today_kst())                # 회의록을 새로 올리면 에이블이 먼저 말을 건넴 (챗봇다운 첫인사)
+                add_message(role="assistant", content=briefing_text(st.session_state.priority_items))
+            except Exception as e:
+                st.session_state.priority_items = []
+                st.error(f"우선순위 분류 중 오류가 발생했습니다: {e}")
+        st.session_state.priority_key = priority_key
+else:
+    st.session_state.priority_items = []
+    st.session_state.priority_key = None
+
 with tab_cal:
     if not meeting_text and not st.session_state.deadline_items:
         st.session_state.deadlines = []
@@ -1712,26 +1794,6 @@ with tab_cal:
         st.caption(f"회의 날짜 {meeting_date.isoformat()} 기준으로 상대적인 기한을 계산했습니다.")
     if meeting_text or st.session_state.deadline_items:
         st.session_state.deadlines = render_deadline_tab()
-
-# ---------------------------------------------------------------
-# 우선순위 탭: 회의록이 바뀔 때만 다시 분류 (버튼을 누를 때마다 LLM을 부르지 않도록)
-# ---------------------------------------------------------------
-if meeting_text:
-    priority_key = hashlib.md5(f"{meeting_text}|{meeting_date}".encode()).hexdigest()
-    if st.session_state.priority_key != priority_key:
-        with st.spinner("에이블이 업무 우선순위를 정리하는 중..."):
-            try:
-                items = extract_tasks(meeting_text, meeting_date)
-                st.session_state.priority_items = classify_tasks(items, meeting_date)
-                # 회의록을 새로 올리면 에이블이 먼저 말을 건넴 (챗봇다운 첫인사)
-                add_message(role="assistant", content=briefing_text(st.session_state.priority_items))
-            except Exception as e:
-                st.session_state.priority_items = []
-                st.error(f"우선순위 분류 중 오류가 발생했습니다: {e}")
-        st.session_state.priority_key = priority_key
-else:
-    st.session_state.priority_items = []
-    st.session_state.priority_key = None
 
 with tab_pri:
     if st.session_state.priority_items:
@@ -1754,6 +1816,9 @@ elif typed and typed.strip():
     pending_text = typed.strip()
 elif send_voice and st.session_state.voice_text:
     pending_text, pending_src = st.session_state.voice_text, "voice"
+    st.session_state.voice_text = None
+    st.session_state.last_audio_hash = None
+    st.session_state.recorder_key += 1     # 다음 실행에서 녹음 위젯을 비움
 
 # ---------------------------------------------------------------
 # 대화 영역: 기존 대화 출력 + 새 요청 처리
@@ -1806,24 +1871,14 @@ with chat_area:
                         f"받는 사람은 {new_draft['to']}, 제목은 {new_draft['subject']}입니다. "
                         f"본문입니다. {new_draft['body']}"
                     )
-                try:
-                    audio = synthesize(speech_text)
-                except Exception as e:
-                    audio = None
-                    st.warning(f"음성 변환에 실패했습니다. 텍스트로 답변을 표시합니다: {e}")
+                audio = synthesize(speech_text)
 
             # 음성 지시로 발송/취소된 경우 결과 줄을 먼저 표시
             for m in st.session_state.messages[n_before:]:
                 render_message(m)
             answer_msg = add_message(role="assistant", content=answer, audio=audio)
             prune_audio()
-            render_message(answer_msg, show_text or not audio, autoplay=True)
-            if src == "voice":
-                st.session_state.voice_text = None
-                st.session_state.voice_audio = None
-                st.session_state.voice_error = None
-                st.session_state.last_audio_hash = None
-                st.session_state.recorder_key += 1
+            render_message(answer_msg, show_text, autoplay=True)
         except Exception as e:
             st.error(f"오류가 발생했습니다: {e}")
 
@@ -1881,3 +1936,4 @@ with download_area:
         file_name="able_chat.txt", mime="text/plain",
         use_container_width=True, disabled=not st.session_state.messages,
     )
+
