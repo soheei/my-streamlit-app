@@ -1,3 +1,4 @@
+
 import os
 import json
 import ssl
@@ -50,8 +51,8 @@ ROBOT_AVATAR = "🤖"    # 채팅 아바타 (이미지는 잘려 보여 이모�
 CHAT_HEIGHT = 400      # 대화 영역 높이(px)
 MAX_HISTORY = 10       # LLM에 전달하는 대화 개수
 KEEP_AUDIO = 10        # 음성을 보관하는 최근 답변 개수
-QUAD_HEIGHT = 300       # 우선순위 4분면 각 칸의 업무 목록 높이(px), 넘치면 스크롤
-RECENT_OPEN = 6       # 펼쳐 두는 최근 메시지 개수 (나머지는 접기)
+QUAD_HEIGHT = 300      # 우선순위 4분면 각 칸의 업무 목록 높이(px), 넘치면 스크롤
+RECENT_OPEN = 6        # 펼쳐 두는 최근 메시지 개수 (나머지는 접기)
 
 # ---------------------------------------------------------------
 # 키 읽어오기: 환경변수(Colab) 우선, 없으면 st.secrets(Streamlit Cloud)
@@ -83,95 +84,44 @@ client = get_client()
 MODEL = "gpt-4.1-mini"
 
 # ---------------------------------------------------------------
-# 메일 본문 변환: 마크다운(■ 소제목, - 목록, | 표 |, **굵게**) → HTML 메일 / 깔끔한 텍스트
-# ---------------------------------------------------------------
-def md_blocks(text):
-    """본문을 블록 목록으로 나눈다. ("head"|"bullet"|"text"|"blank", 문자열) / ("table", [[칸, ...], ...])"""
-    blocks, table = [], []
-    for raw in (text or "").splitlines() + [""]:
-        line = raw.strip()
-        if line.startswith("|") and line.count("|") >= 2:          # 마크다운 표의 한 줄
-            cells = [c.strip() for c in line.strip("|").split("|")]
-            if not all(re.fullmatch(r":?-{2,}:?", c) for c in cells if c):   # |---|---| 구분선은 건너뜀
-                table.append(cells)
-            continue
-        if table:
-            rows = [r for r in table if any(r)]                     # 빈 행 제거
-            if len(rows) > 1:
-                blocks.append(("table", rows))
-            table = []
-        if not line:
-            blocks.append(("blank", ""))
-        elif line.startswith("■") or re.match(r"^#{1,6}\s", line):
-            blocks.append(("head", line.lstrip("■# ").strip()))
-        elif re.match(r"^[-*•·]\s+", line):
-            blocks.append(("bullet", re.sub(r"^[-*•·]\s+", "", line)))
-        else:
-            blocks.append(("text", line))
-    return blocks
-
-def inline_html(text):
-    """특수문자를 안전하게 바꾸고 **굵게**만 <b>로 살린다."""
-    return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escape(text, quote=False))
-
-def body_to_html(text):
-    """메일 본문을 HTML로 바꾼다. 메일 앱 호환을 위해 스타일은 태그에 직접 넣는다."""
-    td = "border:1px solid #c8d1dc;padding:6px 10px;vertical-align:top;"
-    out, bullets = [], []
-
-    def flush_bullets():
-        if bullets:
-            out.append("<ul style='margin:4px 0 10px 0;padding-left:22px;'>" +
-                       "".join(f"<li style='margin:2px 0;'>{b}</li>" for b in bullets) + "</ul>")
-            bullets.clear()
-
-    for kind, value in md_blocks(text):
-        if kind != "bullet":
-            flush_bullets()
-        if kind == "head":
-            title, sep, rest = value.partition(":")
-            out.append(f"<h3 style='margin:18px 0 6px 0;font-size:16px;color:#1f3a5f;'>"
-                       f"■ {inline_html(title.strip())}</h3>")
-            if rest.strip():
-                out.append(f"<p style='margin:4px 0;'>{inline_html(rest.strip())}</p>")
-        elif kind == "bullet":
-            bullets.append(inline_html(value))
-        elif kind == "table":
-            head, *rows = value
-            n = max(len(r) for r in value)
-            html = ["<table style='border-collapse:collapse;margin:6px 0 12px 0;font-size:14px;'>",
-                    "<tr>" + "".join(f"<th style='{td}background:#e8eef7;text-align:left;white-space:nowrap;'>"
-                                     f"{inline_html(c)}</th>" for c in head + [""] * (n - len(head))) + "</tr>"]
-            for r in rows:
-                html.append("<tr>" + "".join(   # 짧은 칸(담당자, 우선순위 등)은 줄바꿈하지 않음
-                    f"<td style='{td}{'white-space:nowrap;' if len(c.replace('**', '')) <= 8 else ''}'>"
-                    f"{inline_html(c)}</td>" for c in r + [""] * (n - len(r))) + "</tr>")
-            out.append("".join(html) + "</table>")
-        elif kind == "text":
-            color = "color:#c0392b;font-weight:bold;" if "확인 필요" in value and "회의 날짜" in value else ""
-            out.append(f"<p style='margin:4px 0;{color}'>{inline_html(value)}</p>")
-    flush_bullets()
-    return ("<div style=\"font-family:'Malgun Gothic','Apple SD Gothic Neo',sans-serif;"
-            "font-size:14px;line-height:1.6;color:#222;\">" + "".join(out) + "</div>")
-
-def body_to_plain(text):
-    """HTML을 못 여는 메일 앱용: 표는 '담당자: … / 업무 내용: …' 줄로, **굵게** 기호는 제거."""
-    lines = []
-    for kind, value in md_blocks(text):
-        value = value.replace("**", "") if isinstance(value, str) else value
-        if kind == "table":
-            head, *rows = [[c.replace("**", "") for c in r] for r in value]
-            for i, r in enumerate(rows, start=1):
-                lines.append(f"{i}. " + " / ".join(f"{h}: {c}" for h, c in zip(head, r) if c))
-        elif kind == "bullet":
-            lines.append(f"- {value}")
-        else:
-            lines.append(value)
-    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
-
-# ---------------------------------------------------------------
 # 이메일 발송 함수 (외부 도구)
 # ---------------------------------------------------------------
+def _inline(text):
+    """**굵게** 만 HTML로 바꾼다 (나머지는 그대로 이스케이프)."""
+    text = escape(text)
+    return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+
+def markdown_to_email_html(body):
+    """메일 본문(Markdown)을 메일 프로그램이 표로 보여 주는 HTML로 바꾼다."""
+    td = "border:1px solid #d0d7de;padding:6px 10px;vertical-align:top;"
+    th = td + "background:#f3f4f6;font-weight:bold;text-align:left;"
+    out, table = [], []
+
+    def flush_table():
+        rows = [r for r in table if not all(re.fullmatch(r":?-+:?", c) or not c for c in r)]
+        if rows:
+            html = ['<table style="border-collapse:collapse;margin:8px 0;font-size:14px;">']
+            for i, row in enumerate(rows):
+                style = th if i == 0 else td
+                tag = "th" if i == 0 else "td"
+                html.append("<tr>" + "".join(f'<{tag} style="{style}">{_inline(c)}</{tag}>' for c in row) + "</tr>")
+            html.append("</table>")
+            out.append("".join(html))
+        table.clear()
+
+    for line in body.split("\n"):
+        s = line.strip()
+        if s.startswith("|") and s.endswith("|"):
+            table.append([c.strip() for c in s.strip("|").split("|")])
+            continue
+        if table:
+            flush_table()
+        out.append(_inline(line) + "<br>" if s else "<br>")
+    if table:
+        flush_table()
+    return ('<div style="font-family:\'Malgun Gothic\',sans-serif;font-size:14px;line-height:1.6;">'
+            + "".join(out) + "</div>")
+
 def send_email(to, subject, body):
     sender = os.getenv("GMAIL_ADDRESS", "").strip()
     password = os.getenv("GMAIL_APP_PASSWORD", "").replace(" ", "")
@@ -182,11 +132,10 @@ def send_email(to, subject, body):
     if not isinstance(subject, str) or any(c in subject for c in "\r\n"):
         return {"status": "failed", "error": "올바른 메일 제목이 필요합니다."}
     try:
-        # 텍스트 + HTML을 함께 보냄: 메일 앱은 HTML(표가 표로 보임)을 우선 표시하고, 못 열면 텍스트를 표시
         msg = MIMEMultipart("alternative")
-        msg.attach(MIMEText(body_to_plain(body), "plain", "utf-8"))
-        msg.attach(MIMEText(body_to_html(body), "html", "utf-8"))
         msg["Subject"], msg["From"], msg["To"] = subject, sender, to
+        msg.attach(MIMEText(body, "plain", "utf-8"))                          # HTML을 못 여는 메일앱용
+        msg.attach(MIMEText(markdown_to_email_html(body), "html", "utf-8"))  # 일반 메일앱은 이걸 표시
         with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as s:
             s.starttls(context=ssl.create_default_context())
             s.login(sender, password)
@@ -1579,45 +1528,16 @@ defaults = {
     "recorder_key": 0,       # 녹음 위젯 초기화용
     "last_audio_hash": None, # 이미 인식한 녹음 (중복 인식 방지)
     "voice_text": None,      # 음성 인식 결과 (사용자가 확인하기 전까지 에이블에게 전달하지 않음)
-    "quick_version": 0,      # 자주 쓰는 요청 편집기 초기화용
-    "quick_base": [          # 자주 쓰는 요청 기본값
-        "회의 내용을 요약해 줘.",
-        "나에게 배정된 업무를 자세히 알려줘.",
-        "후속 조치와 마감 기한만 정리해 줘.",
-        "방금 답변을 이메일로 보내줘.",
-        "제일 급한 업무부터 알려줘.",
-        "이번 주 마감 일정 알려줘.",
-    ],
 }
 for key, value in defaults.items():
     if key not in st.session_state:
         st.session_state[key] = value
 
 # ---------------------------------------------------------------
-# 사이드바: 이미지, 회의록, 이메일, 자주 쓰는 요청, 설정
+# 사이드바: 이미지, 회의록, 이메일, 설정
 # ---------------------------------------------------------------
-queued = None   # 자주 쓰는 요청 버튼으로 들어온 요청
-
 with st.sidebar:
     st.image(ROBOT_URL)
-
-    st.subheader("⚡ 자주 쓰는 요청")
-    quick_area = st.container()
-    with st.expander("✏️ 수정 / 추가 / 삭제"):
-        st.caption("셀을 눌러 수정, 맨 아래 빈 행에 입력해 추가, 행 선택 후 Delete로 삭제합니다.")
-        edited = st.data_editor(
-            pd.DataFrame({"요청": st.session_state.quick_base}),
-            num_rows="dynamic", use_container_width=True,
-            key=f"quick_editor_{st.session_state.quick_version}",
-        )
-        if st.button("기본값으로 되돌리기"):
-            st.session_state.quick_version += 1
-            st.rerun()
-    quick_requests = [str(r).strip() for r in edited["요청"].dropna() if str(r).strip()]
-    with quick_area:
-        for i, q in enumerate(quick_requests):
-            if st.button(q, key=f"quick_{i}", use_container_width=True):
-                queued = q    
 
     st.subheader("📎 회의록")
     meeting_file = st.file_uploader("회의록(txt) 파일", type=["txt"], label_visibility="collapsed")
@@ -1673,6 +1593,13 @@ with tab_chat:
     chat_area = st.container(height=CHAT_HEIGHT, border=True)
     draft_area = chat_area
     report_area = st.container()   # 방금 요약한 회의의 PDF 저장 / 미리보기
+
+    # 자주 쓰는 요청: 누르면 해당 문장이 에이블에게 바로 전달된다
+    quick_requests = [("📋", "회의 내용 요약해 줘"), ("🔥", "제일 급한 업무부터 알려줘"),
+                      ("📅", "이번 주 마감 일정 알려줘")]
+    for col, (icon, text) in zip(st.columns(len(quick_requests)), quick_requests):
+        col.button(f"{icon} {text}", key=f"quick_{text}", on_click=queue_request,
+                   args=(text,), use_container_width=True)
 
     send_voice = False
     with st.expander("🎤 음성으로 요청하기 (녹음 후 인식된 내용을 확인하고 보내세요)", expanded=True):
@@ -1778,13 +1705,11 @@ with tab_pri:
         st.info("왼쪽에서 회의록(txt)을 업로드하면 김 대리님 업무를 긴급·중요 기준으로 나눠 보여 드려요.")
 
 # ---------------------------------------------------------------
-# 이번 실행에서 처리할 요청 결정: 자주 쓰는 요청 > 텍스트 > 새 녹음
+# 이번 실행에서 처리할 요청 결정: 버튼 요청 > 텍스트 > 새 녹음
 # ---------------------------------------------------------------
 pending_text, pending_src = None, "text"
 chip = st.session_state.pop("chip_request", None)
-if queued:
-    pending_text = queued
-elif chip:
+if chip:
     pending_text = chip
     if st.session_state.pop("go_chat", False):
         switch_to_chat_tab()     # 답변이 만들어지기 전에 먼저 대화 탭으로 이동
@@ -1807,7 +1732,7 @@ with chat_area:
             if meeting_file is None:
                 st.warning("먼저 왼쪽에서 회의록(txt)을 업로드해 주세요.")
             st.markdown("- 아래에서 **음성 녹음** 또는 **채팅**으로 요청하세요.\n"
-                        "- 왼쪽의 **자주 쓰는 요청** 버튼도 사용할 수 있어요.")
+                        "- 대화창 아래의 **자주 쓰는 요청** 버튼도 사용할 수 있어요.")
 
     # 오래된 메시지는 접어서 보여 줌
     if len(old) > RECENT_OPEN:
@@ -1876,6 +1801,7 @@ if st.session_state.last_summary_id is not None:
             pdf_download_button(record, key="pdf_latest", container=c2)
             with st.expander("👁️ 요약 보고서(PDF) 미리보기"):
                 show_pdf_preview(record)
+
 
 # ---------------------------------------------------------------
 # 이메일 발송 전 확인 (사용자가 수정 후 발송 / 취소)
