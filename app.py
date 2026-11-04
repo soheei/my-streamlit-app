@@ -907,7 +907,8 @@ defaults = {
     "email_draft": None,     # 발송 전 확인 대기 중인 이메일 초안
     "draft_id": 0,
     "recorder_key": 0,       # 녹음 위젯 초기화용
-    "last_audio_hash": None, # 이미 처리한 녹음 (중복 실행 방지)
+    "last_audio_hash": None, # 이미 인식한 녹음 (중복 인식 방지)
+    "voice_text": None,      # 음성 인식 결과 (사용자가 확인하기 전까지 에이블에게 전달하지 않음)
     "quick_version": 0,      # 자주 쓰는 요청 편집기 초기화용
     "quick_base": [          # 자주 쓰는 요청 기본값
         "회의 내용을 요약해 줘.",
@@ -975,6 +976,7 @@ with st.sidebar:
         st.session_state.messages = []
         st.session_state.email_draft = None
         st.session_state.last_audio_hash = None
+        st.session_state.voice_text = None
         st.session_state.recorder_key += 1
         st.rerun()
 
@@ -997,10 +999,39 @@ with tab_chat:
     chat_area = st.container(height=CHAT_HEIGHT, border=True)
     draft_area = st.container()
 
-    with st.expander("🎤 음성으로 요청하기 (녹음을 마치면 자동으로 실행됩니다)", expanded=True):
-        audio_file = st.audio_input("녹음 버튼을 눌러 말한 뒤, 다시 눌러 종료하세요.",
-                                    key=f"recorder_{st.session_state.recorder_key}",
-                                    label_visibility="collapsed")
+    send_voice = False
+    with st.expander("🎤 음성으로 요청하기 (녹음 후 인식된 내용을 확인하고 보내세요)", expanded=True):
+        rec_col, cancel_col = st.columns([5, 1])
+        with rec_col:
+            audio_file = st.audio_input("녹음 버튼을 눌러 말한 뒤, 다시 눌러 종료하세요.",
+                                        key=f"recorder_{st.session_state.recorder_key}",
+                                        label_visibility="collapsed")
+        with cancel_col:
+            # 녹음 중이거나 녹음 후라도 위젯을 새로 만들어 녹음을 버린다 (에이블에게 전달되지 않음)
+            if st.button("❌ 취소", key="voice_cancel", use_container_width=True,
+                         help="녹음을 취소합니다. 에이블에게 전달되지 않습니다."):
+                st.session_state.voice_text = None
+                st.session_state.last_audio_hash = None
+                st.session_state.recorder_key += 1
+                st.rerun()
+
+        # 새 녹음이 끝나면 인식 결과만 보여 주고, 사용자가 확인해야 에이블에게 전달
+        if audio_file is not None:
+            audio_bytes = audio_file.getvalue()
+            audio_hash = hashlib.md5(audio_bytes).hexdigest()
+            if audio_hash != st.session_state.last_audio_hash:
+                st.session_state.last_audio_hash = audio_hash
+                with st.spinner("음성 인식 중..."):
+                    try:
+                        st.session_state.voice_text = transcribe(audio_bytes).strip()
+                    except Exception as e:
+                        st.session_state.voice_text = None
+                        st.error(f"음성 인식 중 오류가 발생했습니다: {e}")
+        if st.session_state.voice_text is not None and audio_file is not None:
+            st.caption("🎧 인식된 내용")
+            st.info(st.session_state.voice_text or "(인식된 내용이 없습니다)")
+            send_voice = st.button("✅ 이 내용으로 요청", type="primary", key="voice_send",
+                                   disabled=not st.session_state.voice_text)
 
 typed = st.chat_input("메시지를 입력하세요. (예: 회의 내용을 요약해 줘)")
 
@@ -1034,24 +1065,23 @@ with tab_cal:
 # ---------------------------------------------------------------
 # 이번 실행에서 처리할 요청 결정: 자주 쓰는 요청 > 텍스트 > 새 녹음
 # ---------------------------------------------------------------
-pending_text, pending_audio = None, None
+pending_text, pending_src = None, "text"
 if queued:
     pending_text = queued
 elif typed and typed.strip():
     pending_text = typed.strip()
-elif audio_file is not None:
-    audio_bytes = audio_file.getvalue()
-    audio_hash = hashlib.md5(audio_bytes).hexdigest()
-    if audio_hash != st.session_state.last_audio_hash:
-        pending_audio = audio_bytes
-        st.session_state.last_audio_hash = audio_hash
+elif send_voice and st.session_state.voice_text:
+    pending_text, pending_src = st.session_state.voice_text, "voice"
+    st.session_state.voice_text = None
+    st.session_state.last_audio_hash = None
+    st.session_state.recorder_key += 1     # 다음 실행에서 녹음 위젯을 비움
 
 # ---------------------------------------------------------------
 # 대화 영역: 기존 대화 출력 + 새 요청 처리
 # ---------------------------------------------------------------
 with chat_area:
     old = st.session_state.messages
-    if not old and not (pending_text or pending_audio):
+    if not old and not pending_text:
         with st.chat_message("assistant", avatar=ROBOT_URL):
             st.markdown("안녕하세요, 김 대리님! 개인비서 **에이블**입니다. 👋")
             if meeting_file is None:
@@ -1073,15 +1103,10 @@ with chat_area:
         render_message(m, show_text, autoplay=autoplay_last and m is recent[-1])
 
     # 새 요청 처리
-    if pending_text or pending_audio:
-        src = "text"
+    if pending_text:
+        src = pending_src
         user_text = pending_text
         try:
-            if pending_audio:
-                src = "voice"
-                with st.spinner("음성 인식 중..."):
-                    user_text = transcribe(pending_audio)
-
             # LLM에 보낼 대화 히스토리: 새 메시지를 추가하기 전의 text 메시지 최근 N개
             history = [{"role": m["role"], "content": m["content"]}
                        for m in st.session_state.messages if m["kind"] == "text"][-MAX_HISTORY:]
