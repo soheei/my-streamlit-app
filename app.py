@@ -48,7 +48,8 @@ ROBOT_AVATAR = "🤖"    # 채팅 아바타 (이미지는 잘려 보여 이모�
 CHAT_HEIGHT = 400      # 대화 영역 높이(px)
 MAX_HISTORY = 10       # LLM에 전달하는 대화 개수
 KEEP_AUDIO = 10        # 음성을 보관하는 최근 답변 개수
-RECENT_OPEN = 6        # 펼쳐 두는 최근 메시지 개수 (나머지는 접기)
+QUAD_HEIGHT = 300       # 우선순위 4분면 각 칸의 업무 목록 높이(px), 넘치면 스크롤
+RECENT_OPEN = 6       # 펼쳐 두는 최근 메시지 개수 (나머지는 접기)
 
 # ---------------------------------------------------------------
 # 키 읽어오기: 환경변수(Colab) 우선, 없으면 st.secrets(Streamlit Cloud)
@@ -524,6 +525,9 @@ def speech_clean(text):
         s = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", s)   # 링크
         lines.append(s)
     result = "\n".join(lines)
+    # 2026-11-13 → 2026년 11월 13일 (숫자를 하나씩 끊어 읽지 않고 날짜로 읽게 함)
+    result = re.sub(r"(?<!\d)(\d{4})-(\d{1,2})-(\d{1,2})(?!\d)",
+                    lambda m: f"{m[1]}년 {int(m[2])}월 {int(m[3])}일", result)
     result = re.sub(r"[*_`~■□▶▷●○◆◇⚠️]|️", "", result)  # 남은 서식·장식 기호
     return re.sub(r"\n{2,}", "\n", result).strip()
 
@@ -1071,17 +1075,23 @@ def render_priority_tab(tasks):
             items = [t for t in tasks if (t["urgent"], t["important"]) == key]
             with col:
                 with st.container(border=True):
-                    st.markdown(f"##### {q['icon']} {q['title']}")
+                    # 제목은 고정, 업무 목록만 고정 높이 안에서 스크롤
+                    st.markdown(f"##### {q['icon']} {q['title']} · {len(items)}건")
                     st.caption(f"→ {q['action']}")
-                    if not items:
-                        st.caption("해당 업무 없음")
-                    for i, t in enumerate(items):
-                        st.markdown(f"**{t['task']}**")
-                        st.caption(f"{fmt_dday(t['d_day'])} · 요청: {t['requester'] or '미정'} · "
-                                   f"중요도 {'★' * t['importance']}{'☆' * (5 - t['importance'])}")
-                        st.button("🤖 에이블에게 묻기", key=f"pri_{q['order']}_{i}",
-                                  on_click=queue_request,
-                                  args=(f"'{t['task']}' 업무는 어떻게 시작하면 좋을지 단계별로 알려줘.",))
+                    with st.container(height=QUAD_HEIGHT):
+                        if not items:
+                            st.caption("해당 업무 없음")
+                        for i, t in enumerate(items):
+                            if i:
+                                st.divider()
+                            info, ask = st.columns([4, 1.3], vertical_alignment="center")
+                            info.markdown(f"**{t['task']}**")
+                            info.caption(f"{fmt_dday(t['d_day'])} · 요청: {t['requester'] or '미정'} · "
+                                         f"중요도 {'★' * t['importance']}{'☆' * (5 - t['importance'])}")
+                            ask.button("🤖 묻기", key=f"pri_{q['order']}_{i}",
+                                       help="에이블에게 시작 방법을 물어봅니다",
+                                       use_container_width=True, on_click=queue_request,
+                                       args=(f"'{t['task']}' 업무는 어떻게 시작하면 좋을지 단계별로 알려줘.",))
     with st.expander("📋 표로 보기 · 판단 근거"):
         st.dataframe(pd.DataFrame([{
             "분류": t["quadrant"]["action"], "업무": t["task"], "요청자": t["requester"],
