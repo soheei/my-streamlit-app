@@ -414,6 +414,9 @@ def speech_clean(text):
         s = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", s)   # 링크
         lines.append(s)
     result = "\n".join(lines)
+    # 2026-11-13 → 2026년 11월 13일 (숫자를 하나씩 끊어 읽지 않고 날짜로 읽게 함)
+    result = re.sub(r"(?<!\d)(\d{4})-(\d{1,2})-(\d{1,2})(?!\d)",
+                    lambda m: f"{m[1]}년 {int(m[2])}월 {int(m[3])}일", result)
     result = re.sub(r"[*_`~■□▶▷●○◆◇⚠️]|️", "", result)  # 남은 서식·장식 기호
     return re.sub(r"\n{2,}", "\n", result).strip()
 
@@ -1209,45 +1212,16 @@ defaults = {
     "recorder_key": 0,       # 녹음 위젯 초기화용
     "last_audio_hash": None, # 이미 인식한 녹음 (중복 인식 방지)
     "voice_text": None,      # 음성 인식 결과 (사용자가 확인하기 전까지 에이블에게 전달하지 않음)
-    "quick_version": 0,      # 자주 쓰는 요청 편집기 초기화용
-    "quick_base": [          # 자주 쓰는 요청 기본값
-        "회의 내용을 요약해 줘.",
-        "나에게 배정된 업무를 자세히 알려줘.",
-        "후속 조치와 마감 기한만 정리해 줘.",
-        "방금 답변을 이메일로 보내줘.",
-        "제일 급한 업무부터 알려줘.",
-        "이번 주 마감 일정 알려줘.",
-    ],
 }
 for key, value in defaults.items():
     if key not in st.session_state:
         st.session_state[key] = value
 
 # ---------------------------------------------------------------
-# 사이드바: 이미지, 회의록, 이메일, 자주 쓰는 요청, 설정
+# 사이드바: 이미지, 회의록, 이메일, 설정
 # ---------------------------------------------------------------
-queued = None   # 자주 쓰는 요청 버튼으로 들어온 요청
-
 with st.sidebar:
     st.image(ROBOT_URL)
-
-    st.subheader("⚡ 자주 쓰는 요청")
-    quick_area = st.container()
-    with st.expander("✏️ 수정 / 추가 / 삭제"):
-        st.caption("셀을 눌러 수정, 맨 아래 빈 행에 입력해 추가, 행 선택 후 Delete로 삭제합니다.")
-        edited = st.data_editor(
-            pd.DataFrame({"요청": st.session_state.quick_base}),
-            num_rows="dynamic", use_container_width=True,
-            key=f"quick_editor_{st.session_state.quick_version}",
-        )
-        if st.button("기본값으로 되돌리기"):
-            st.session_state.quick_version += 1
-            st.rerun()
-    quick_requests = [str(r).strip() for r in edited["요청"].dropna() if str(r).strip()]
-    with quick_area:
-        for i, q in enumerate(quick_requests):
-            if st.button(q, key=f"quick_{i}", use_container_width=True):
-                queued = q    
 
     st.subheader("📎 회의록")
     meeting_file = st.file_uploader("회의록(txt) 파일", type=["txt"], label_visibility="collapsed")
@@ -1301,6 +1275,13 @@ with tab_chat:
     # 대화창은 전체 너비. 이메일 초안은 대화창 안(맨 아래)에 카드로 들어가 함께 스크롤된다.
     chat_area = st.container(height=CHAT_HEIGHT, border=True)
     draft_area = chat_area
+
+    # 자주 쓰는 요청: 누르면 해당 문장이 에이블에게 바로 전달된다
+    quick_requests = [("📋", "회의 내용 요약해 줘"), ("🔥", "제일 급한 업무부터 알려줘"),
+                      ("📅", "이번 주 마감 일정 알려줘")]
+    for col, (icon, text) in zip(st.columns(len(quick_requests)), quick_requests):
+        col.button(f"{icon} {text}", key=f"quick_{text}", on_click=queue_request,
+                   args=(text,), use_container_width=True)
 
     send_voice = False
     with st.expander("🎤 음성으로 요청하기 (녹음 후 인식된 내용을 확인하고 보내세요)", expanded=True):
@@ -1406,13 +1387,11 @@ with tab_pri:
         st.info("왼쪽에서 회의록(txt)을 업로드하면 김 대리님 업무를 긴급·중요 기준으로 나눠 보여 드려요.")
 
 # ---------------------------------------------------------------
-# 이번 실행에서 처리할 요청 결정: 자주 쓰는 요청 > 텍스트 > 새 녹음
+# 이번 실행에서 처리할 요청 결정: 버튼 요청 > 텍스트 > 새 녹음
 # ---------------------------------------------------------------
 pending_text, pending_src = None, "text"
 chip = st.session_state.pop("chip_request", None)
-if queued:
-    pending_text = queued
-elif chip:
+if chip:
     pending_text = chip
     st.toast("에이블에게 물어봤어요! 💬 대화 탭에서 답변을 확인하세요.")
 elif typed and typed.strip():
