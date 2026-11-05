@@ -1475,6 +1475,11 @@ CAL_CSS = (
     ".able-cal .pill{font-size:11px;color:#fff;border-radius:4px;padding:1px 5px;margin-bottom:2px;"
     "white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}"
     # 우선순위 색: 1 빨강(긴급·중요) · 2 파랑(중요) · 3 주황(긴급) · 4 회색(둘 다 아님)
+    ".able-cal .pill{display:flex;align-items:center;justify-content:space-between;gap:4px;white-space:normal;}"
+    ".able-cal .pill .cb{flex:none;width:14px;height:14px;border:1.5px solid rgba(255,255,255,.9);border-radius:3px;"
+    "font-size:11px;line-height:12px;text-align:center;}"
+    ".able-cal .etc .cb{border-color:rgba(128,128,128,.8);}"
+    ".able-cal .pill.done{opacity:.55;}.able-cal .pill.done .t{text-decoration:line-through;}"
     ".able-cal .p1{background:#E5484D;}.able-cal .p2{background:#3E63DD;}"
     ".able-cal .p3{background:#F76B15;}.able-cal .p4{background:#8B8D98;}"
     ".able-cal .kim{background:#12A594;}"   # 김 대리 업무지만 우선순위 분류 전
@@ -1566,8 +1571,11 @@ def month_grid_html(year, month, dated, today, max_items=3, priority_items=None)
             styled.sort(key=lambda x: rank[x[1]])
             items = styled
             pills = "".join(
-                f"<div class='pill {cls}' title='{escape(label)} · {escape(d['task'])}'>"
-                f"{icon}{escape(d['task'])}</div>" for d, cls, icon, label in items[:max_items])
+                f"<div class='pill {cls}{' done' if d.get('done') else ''}' "
+                f"title='{escape(label)} · {escape(d['task'])}'>"
+                f"<span class='t'>{icon}{escape(d['task'])}</span>"
+                f"<span class='cb'>{'✓' if d.get('done') else ''}</span></div>"
+                for d, cls, icon, label in items[:max_items])
             more = f"<div class='more'>+{len(items) - max_items}건 더</div>" if len(items) > max_items else ""
             cells.append(f"<td class='{cls.strip()}'><div class='num'>{day.day}</div>{pills}{more}</td>")
         rows.append("<tr>" + "".join(cells) + "</tr>")
@@ -1722,8 +1730,9 @@ def render_deadline_tab():
             n3.markdown(f"<div style='text-align:center;font-size:1.3rem;font-weight:700;padding-top:4px'>"
                         f"{month.year}년 {month.month}월</div>", unsafe_allow_html=True)
             n4.button("다음 달 ▶", on_click=shift_month, args=(1,), use_container_width=True)
-            render_month_checkboxes(month.year, month.month, dated, today,
-                                    st.session_state.get("priority_items", []))
+            st.markdown(month_grid_html(month.year, month.month, dated, today,
+                                        priority_items=st.session_state.get("priority_items", [])),
+                        unsafe_allow_html=True)
             st.markdown(CAL_CSS + priority_legend_html(), unsafe_allow_html=True)
 
     if undated:
