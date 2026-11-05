@@ -798,7 +798,7 @@ def make_ics(deadlines):
 def set_deadlines(items, refresh_editor=True):
     """도구로 바뀐 마감 일정을 저장하고 달력 탭의 편집기를 새 값으로 다시 그리게 한다."""
     items = [{"id": uuid.uuid4().hex, "requester": "", "rush": False,
-              "importance": 3, "evidence": "", **item} for item in items]
+              "importance": 3, "evidence": "", "done": False, **item} for item in items]
     st.session_state.deadline_items = items
     st.session_state.deadlines = items
     st.session_state.priority_items = classify_tasks(
@@ -1103,22 +1103,6 @@ def switch_to_chat_tab():
         "if (tab) { tab.click(); return; }"
         "if (++attempts < 50) setTimeout(activateChat, 100);"
         "} activateChat();</script>", height=0)
-
-def briefing_text(tasks):
-    """회의록을 올리면 에이블이 먼저 건네는 브리핑 메시지 (LLM 호출 없이 결과로 작성)."""
-    if not tasks:
-        return ("김 대리님, 회의록 잘 읽었어요! 📄 이번 회의에서 김 대리님께 배정된 업무는 찾지 못했어요.\n\n"
-                "회의 내용이 궁금하시면 \"회의 내용 요약해 줘\"라고 말씀해 주세요.")
-    first = [t for t in tasks if t["quadrant"]["order"] == 1]
-    lines = [f"김 대리님, 회의록 잘 읽었어요! 📄 배정된 업무는 총 **{len(tasks)}개**예요.", ""]
-    for t in tasks:
-        lines.append(f"- {t['quadrant']['icon']} **{t['task']}** · {fmt_dday(t['d_day'])} · {t['quadrant']['action']}")
-    lines.append("")
-    if first:
-        lines.append(f"가장 먼저 챙기실 일은 **{first[0]['task']}**이에요. 어떻게 시작할지 같이 정리해 드릴까요?")
-    else:
-        lines.append("급한 일은 없어요. 중요한 업무부터 계획을 세워 보는 건 어떨까요?")
-    return "\n".join(lines)
 
 def render_priority_tab(tasks):
     """④ 화면: 슬라이드와 같은 배치의 2×2 매트릭스 + 표."""
@@ -1498,6 +1482,7 @@ CAL_CSS = (
     ".able-legend{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:12px;margin:6px 0 2px;}"
     ".able-legend span{display:inline-flex;align-items:center;gap:5px;}"
     ".able-legend i{width:12px;height:12px;border-radius:3px;display:inline-block;}"
+    ".able-cal .pill.done{opacity:.5;text-decoration:line-through;}"   # 완료된 업무: 흐리게 + 취소선
     ".able-cal .more{font-size:11px;opacity:.7;}"
     "</style>"
 )
@@ -1582,8 +1567,10 @@ def month_grid_html(year, month, dated, today, max_items=3, priority_items=None)
             styled.sort(key=lambda x: rank[x[1]])
             items = styled
             pills = "".join(
-                f"<div class='pill {cls}' title='{escape(label)} · {escape(d['task'])}'>"
-                f"{icon}{escape(d['task'])}</div>" for d, cls, icon, label in items[:max_items])
+                f"<div class='pill {cls}{' done' if d.get('done') else ''}' "
+                f"title='{escape(label)} · {escape(d['task'])}{' (완료)' if d.get('done') else ''}'>"
+                f"{'✅ ' if d.get('done') else icon}{escape(d['task'])}</div>"
+                for d, cls, icon, label in items[:max_items])
             more = f"<div class='more'>+{len(items) - max_items}건 더</div>" if len(items) > max_items else ""
             cells.append(f"<td class='{cls.strip()}'><div class='num'>{day.day}</div>{pills}{more}</td>")
         rows.append("<tr>" + "".join(cells) + "</tr>")
@@ -1597,16 +1584,20 @@ def render_deadline_tab():
 
     summary_area = st.container()
     cal_area = st.container()
+    undated_area = st.container()   # 날짜 미정 일정: 표 위에 표시 (아래에서 채움)
 
     st.markdown("##### ✏️ 마감 일정 목록 (수정 · 추가 · 삭제 가능)")
     st.caption("AI가 찾은 결과는 틀릴 수 있어요. 표에서 직접 고치면 달력과 에이블의 답변에 바로 반영됩니다.")
+    # 목록이 비어 있어도(분석 전) 열 타입이 맞도록 자료형을 직접 지정한다.
+    # 빈 리스트는 pandas가 float64로 만들어 체크박스/텍스트 열 설정과 충돌하기 때문.
     df = pd.DataFrame({
-        "id": [i["id"] for i in items],
-        "업무": [i["task"] for i in items],
-        "담당자": [i["assignee"] for i in items],
-        "마감일": pd.to_datetime([i["due"] for i in items]),
-        "김 대리 업무": [i["is_kim"] for i in items],
-        "원문 표현": [i["due_text"] for i in items],
+        "id": pd.Series([i["id"] for i in items], dtype="object"),
+        "업무": pd.Series([i["task"] for i in items], dtype="object"),
+        "담당자": pd.Series([i["assignee"] for i in items], dtype="object"),
+        "마감일": pd.Series(pd.to_datetime([i["due"] for i in items]), dtype="datetime64[ns]"),
+        "김 대리 업무": pd.Series([bool(i["is_kim"]) for i in items], dtype="bool"),
+        "완료": pd.Series([bool(i.get("done")) for i in items], dtype="bool"),
+        "원문 표현": pd.Series([i["due_text"] for i in items], dtype="object"),
     })
     edited = st.data_editor(
         df, num_rows="dynamic", hide_index=True, use_container_width=True,
@@ -1615,6 +1606,7 @@ def render_deadline_tab():
             "id": None,
             "마감일": st.column_config.DateColumn("마감일", format="YYYY-MM-DD"),
             "김 대리 업무": st.column_config.CheckboxColumn("김 대리 업무"),
+            "완료": st.column_config.CheckboxColumn("완료", help="체크하면 달력에서 취소선으로 표시돼요"),
         },
     )
 
@@ -1625,6 +1617,7 @@ def render_deadline_tab():
         if not task:
             continue
         flag = row.get("김 대리 업무")
+        done = row.get("완료")
         deadlines.append({
             **original_by_id.get(clean(row.get("id")), {}),
             "task": task,
@@ -1632,6 +1625,7 @@ def render_deadline_tab():
             "due": parse_date(row.get("마감일")),
             "is_kim": False if flag is None or clean(flag) == "" else bool(flag),
             "due_text": clean(row.get("원문 표현")),
+            "done": False if done is None or clean(done) == "" else bool(done),
         })
 
     changed = deadlines != items
@@ -1679,16 +1673,13 @@ def render_deadline_tab():
             st.markdown(CAL_CSS + priority_legend_html(), unsafe_allow_html=True)
 
     if undated:
-        st.warning("📌 날짜 미정: " + " / ".join(d["task"] for d in undated))
+        with undated_area:
+            st.warning("📌 **날짜 미정 일정** (아래 표에서 마감일을 지정하면 달력에 추가돼요)\n\n" +
+                       "\n".join(f"- {d['task']} ({d['assignee'] or '담당자 미정'})" for d in undated))
 
-    b1, b2 = st.columns(2)
-    b1.download_button("📥 캘린더 파일(.ics) 받기", data=make_ics(deadlines),
+    st.download_button("📥 캘린더 파일(.ics) 받기", data=make_ics(deadlines),
                        file_name="able_deadlines.ics", mime="text/calendar",
                        use_container_width=True, disabled=not dated)
-    if b2.button("🔄 업무 다시 추출", use_container_width=True):
-        st.session_state.deadline_key = None
-        st.session_state.skip_briefing = True
-        st.rerun()
     return deadlines
 
 # ---------------------------------------------------------------
@@ -1696,7 +1687,8 @@ def render_deadline_tab():
 # ---------------------------------------------------------------
 defaults = {
     "deadline_items": [],    # 회의록에서 추출한 마감 일정 (편집기 초기값)
-    "deadline_key": None,    # 마지막으로 추출한 회의록/날짜 식별값
+    "analyzed_key": None,    # 업무 추출을 마친 회의록/날짜 식별값 (업로드만으로는 추출하지 않음)
+    "analyze_failed_key": None,  # 요청으로 자동 추출하다 실패한 회의록 (같은 회의록에서 반복 실패 방지)
     "deadline_version": 0,   # 마감 일정 편집기 초기화용
     "deadline_changed": False,  # 이번 요청에서 도구가 마감 일정을 바꿨는지
     "cal_month": None,       # 달력에 표시 중인 달 (그 달의 1일)
@@ -1887,41 +1879,53 @@ with tab_rec:
 # ---------------------------------------------------------------
 # 마감 달력 탭: 회의록이 바뀌면 마감 일정을 다시 추출 (에이블 답변보다 먼저 실행해 목록을 반영)
 # ---------------------------------------------------------------
+analyzed = False
 if meeting_text:
     priority_key = hashlib.md5(f"{meeting_text}|{meeting_date}".encode()).hexdigest()
-    if st.session_state.priority_key != priority_key or st.session_state.deadline_key is None:
-        # try 밖에서 꺼내야 실패해도 플래그가 남지 않음
-        skip_briefing = st.session_state.pop("skip_briefing", False)
+    if st.session_state.priority_key != priority_key:
+        # 회의록(또는 회의 날짜)이 바뀜: 이전 회의록의 결과만 비우고, 사용자가 실행할 때까지 기다린다
+        if st.session_state.priority_key is not None:
+            set_deadlines([])
+            st.session_state.deadline_changed = False
+        st.session_state.priority_key = priority_key
+        st.session_state.analyzed_key = None
+        st.session_state.analyze_failed_key = None
+
+    # 실행 조건: ① 사용자가 에이블에게 요청(채팅·음성·자주 쓰는 요청)을 보냈는데 아직 추출 전
+    #            ② 마감 달력의 '업무 다시 추출' 버튼
+    # 업로드만으로는 아무것도 실행하지 않는다 (파일만 첨부된 상태로 대기)
+    reason = st.session_state.pop("analyze_request", None)
+    if (reason is None and st.session_state.get("chip_request")
+            and st.session_state.analyzed_key != priority_key
+            and st.session_state.analyze_failed_key != priority_key):
+        reason = "command"
+    if reason:
         with st.spinner("에이블이 업무를 정리하는 중..."):
             try:
                 items = extract_tasks(meeting_text, meeting_date)
                 set_deadlines(items)
                 st.session_state.deadline_changed = False
-                if not skip_briefing:
-                    add_message(role="assistant", content=briefing_text(st.session_state.priority_items))
+                st.session_state.analyzed_key = priority_key
             except Exception as e:
                 st.error(f"업무 추출 중 오류가 발생했습니다: {e}")
-                # 다른 회의록으로 바꿨다가 실패한 경우에만 이전 회의록 업무를 비움
-                if st.session_state.priority_key != priority_key:
-                    set_deadlines([])
-                    st.session_state.deadline_changed = False
-        # 성공·실패와 관계없이 기록 → 실패 시 무한 재호출 방지
-        st.session_state.priority_key = priority_key
-        st.session_state.deadline_key = priority_key
+                st.session_state.analyze_failed_key = priority_key
+    analyzed = st.session_state.analyzed_key == priority_key
 else:
     if st.session_state.priority_key is not None:   # 회의록을 방금 지운 경우에만 비움
         set_deadlines([])
         st.session_state.deadline_changed = False
     st.session_state.priority_key = None
+    st.session_state.analyzed_key = None
 
 set_deadlines(st.session_state.deadline_items, refresh_editor=False)
 
 with tab_cal:
     if not meeting_text and not st.session_state.deadline_items:
         st.session_state.deadlines = []
-        st.session_state.deadline_key = None
-        st.info("왼쪽에서 회의록(txt)을 업로드하면 마감 일정을 자동으로 찾아 달력에 표시합니다. "
+        st.info("왼쪽에서 회의록(txt)을 업로드하고 에이블에게 요청하면 마감 일정을 찾아 달력에 표시합니다. "
                 "에이블에게 \"다음 주 금요일에 ○○ 마감 표시해줘\"라고 말해도 됩니다.")
+    elif meeting_text and not analyzed:
+        st.info("회의록이 첨부되어 있어요. 에이블에게 요청하면 마감 일정을 찾아 달력에 표시합니다.")
     elif meeting_text:
         if len(meetings) > 1:
             st.caption("회의록 " + ", ".join(f"{m['name']}({m['date'].isoformat()})" for m in meetings)
@@ -1937,10 +1941,12 @@ with tab_cal:
 with tab_pri:
     if st.session_state.priority_items:
         render_priority_tab(st.session_state.priority_items)
+    elif meeting_text and not analyzed:
+        st.info("회의록이 첨부되어 있어요. 에이블에게 요청하면 김 대리님 업무를 긴급·중요 기준으로 나눠 보여 드려요.")
     elif meeting_text:
         st.info("이번 회의록에서 김 대리님께 배정된 업무를 찾지 못했어요.")
     else:
-        st.info("왼쪽에서 회의록(txt)을 업로드하면 김 대리님 업무를 긴급·중요 기준으로 나눠 보여 드려요.")
+        st.info("왼쪽에서 회의록(txt)을 업로드하고 에이블에게 요청하면 김 대리님 업무를 긴급·중요 기준으로 나눠 보여 드려요.")
 
 # ---------------------------------------------------------------
 # 이번 실행에서 처리할 요청 결정: 버튼 요청 > 텍스트 > 새 녹음
