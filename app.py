@@ -1749,7 +1749,9 @@ def render_deadline_tab():
 
     if undated:
         with undated_area:
-            with st.container(border=True):
+            st.markdown("<style>.st-key-undated_box{background:#FFF9DB;border-radius:8px;}"
+                        ".st-key-undated_box *{color:#333;}</style>", unsafe_allow_html=True)
+            with st.container(border=True, key="undated_box"):
                 st.markdown(f"##### ⚠️ 날짜 미정 일정 ({len(undated)}건)")
                 st.caption("날짜를 고르고 '날짜 지정'을 누르면 달력에 추가돼요.")
                 for d in undated:
