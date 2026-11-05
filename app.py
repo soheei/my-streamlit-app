@@ -1891,7 +1891,7 @@ if meeting_text:
     #            ② 마감 달력의 '업무 다시 추출' 버튼
     # 업로드만으로는 아무것도 실행하지 않는다 (파일만 첨부된 상태로 대기)
     reason = st.session_state.pop("analyze_request", None)
-    if (reason is None and st.session_state.get("chip_request")
+    if (reason is None
             and st.session_state.analyzed_key != priority_key
             and st.session_state.analyze_failed_key != priority_key):
         reason = "command"
