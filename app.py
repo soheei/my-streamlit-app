@@ -1958,9 +1958,8 @@ with chat_area:
     old = st.session_state.messages
     if not old and not pending_text:
         with st.chat_message("assistant", avatar=ROBOT_AVATAR):
-            st.markdown("안녕하세요, 김 대리님! 개인비서 **에이블**입니다. 👋")
-            if not meetings:
-                st.warning("먼저 왼쪽에서 회의록(txt)을 업로드해 주세요.")
+            st.markdown("안녕하세요, 김 대리님! 개인비서 **에이블**입니다. 👋\n\n"
+                        "**어떤 업무를 도와드릴까요?**")
             st.markdown("- 아래에서 **음성 녹음** 또는 **채팅**으로 요청하세요.\n"
                         "- 입력창 바로 위의 **자주 쓰는 요청** 버튼도 사용할 수 있어요.")
 
