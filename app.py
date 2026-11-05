@@ -1,5 +1,3 @@
-%%writefile app.py
-
 import os
 import json
 import ssl
