@@ -1724,11 +1724,13 @@ for key, value in defaults.items():
 with st.sidebar:
     st.image(ROBOT_URL)
 
-    head_col, title_col = st.columns([1, 5], vertical_alignment="center")
-    with head_col:
-        st.image(ABLE_HEAD, width=42)
-    with title_col:
-        st.markdown("### 회의록")
+    head_b64 = base64.b64encode(ABLE_HEAD).decode()
+    st.markdown(
+        f'<div style="display:flex;align-items:center;gap:4px;">'
+        f'<img src="data:image/png;base64,{head_b64}" width="42">'
+        f'<h3 style="margin:0;padding:0;">회의록</h3></div>',
+        unsafe_allow_html=True,
+    )
     meeting_files = st.file_uploader("회의록(txt) 파일", type=["txt"], label_visibility="collapsed",
                                      accept_multiple_files=True)
     meetings = []   # [{"name", "text", "date"}] 회의록별 내용과 회의 날짜
@@ -2075,5 +2077,3 @@ with download_area:
         file_name="able_chat.txt", mime="text/plain",
         use_container_width=True, disabled=not st.session_state.messages,
     )
-
-
