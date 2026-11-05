@@ -798,7 +798,7 @@ def make_ics(deadlines):
 def set_deadlines(items, refresh_editor=True):
     """도구로 바뀐 마감 일정을 저장하고 달력 탭의 편집기를 새 값으로 다시 그리게 한다."""
     items = [{"id": uuid.uuid4().hex, "requester": "", "rush": False,
-              "importance": 3, "evidence": "", "done": False, **item} for item in items]
+              "importance": 3, "evidence": "", **item} for item in items]
     st.session_state.deadline_items = items
     st.session_state.deadlines = items
     st.session_state.priority_items = classify_tasks(
@@ -1482,7 +1482,6 @@ CAL_CSS = (
     ".able-legend{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:12px;margin:6px 0 2px;}"
     ".able-legend span{display:inline-flex;align-items:center;gap:5px;}"
     ".able-legend i{width:12px;height:12px;border-radius:3px;display:inline-block;}"
-    ".able-cal .pill.done{opacity:.5;text-decoration:line-through;}"   # 완료된 업무: 흐리게 + 취소선
     ".able-cal .more{font-size:11px;opacity:.7;}"
     "</style>"
 )
@@ -1567,10 +1566,8 @@ def month_grid_html(year, month, dated, today, max_items=3, priority_items=None)
             styled.sort(key=lambda x: rank[x[1]])
             items = styled
             pills = "".join(
-                f"<div class='pill {cls}{' done' if d.get('done') else ''}' "
-                f"title='{escape(label)} · {escape(d['task'])}{' (완료)' if d.get('done') else ''}'>"
-                f"{'✅ ' if d.get('done') else icon}{escape(d['task'])}</div>"
-                for d, cls, icon, label in items[:max_items])
+                f"<div class='pill {cls}' title='{escape(label)} · {escape(d['task'])}'>"
+                f"{icon}{escape(d['task'])}</div>" for d, cls, icon, label in items[:max_items])
             more = f"<div class='more'>+{len(items) - max_items}건 더</div>" if len(items) > max_items else ""
             cells.append(f"<td class='{cls.strip()}'><div class='num'>{day.day}</div>{pills}{more}</td>")
         rows.append("<tr>" + "".join(cells) + "</tr>")
@@ -1674,8 +1671,7 @@ def render_deadline_tab():
 
     if undated:
         with undated_area:
-            st.warning("📌 **날짜 미정 일정** (아래 표에서 마감일을 지정하면 달력에 추가돼요)\n\n" +
-                       "\n".join(f"- {d['task']} ({d['assignee'] or '담당자 미정'})" for d in undated))
+            st.warning("📌 날짜 미정: " + " / ".join(d["task"] for d in undated))
 
     st.download_button("📥 캘린더 파일(.ics) 받기", data=make_ics(deadlines),
                        file_name="able_deadlines.ics", mime="text/calendar",
