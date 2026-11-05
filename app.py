@@ -433,15 +433,32 @@ def build_instructions(meeting_text, recipient, draft=None, deadlines=None):
 7. 액션 아이템이 없으면 표 대신 '기록에 없음'이라고 쓰세요.
 """
     role += f"\n오늘 날짜는 {today_kst().isoformat()} 입니다.\n"
-    role += f"회의 날짜(사이드바에서 선택)는 {st.session_state.get('meeting_date_str', today_kst().isoformat())} 입니다. save_summary의 meeting_date에는 이 날짜를 쓰세요.\n"
+    meetings = st.session_state.get("meetings") or []
+    if len(meetings) > 1:
+        role += "회의 날짜는 회의록마다 다릅니다(아래 [회의 날짜] 참고). save_summary의 meeting_date에는 요약한 회의록의 날짜를 쓰세요.\n"
+    else:
+        role += f"회의 날짜(사이드바에서 선택)는 {st.session_state.get('meeting_date_str', today_kst().isoformat())} 입니다. save_summary의 meeting_date에는 이 날짜를 쓰세요.\n"
     if recipient:
         role += f"\n사용자가 따로 말하지 않으면 이메일 수신자는 {recipient} 입니다.\n"
     if draft:
         role += (f"\n[발송 대기 중인 이메일 초안]\n받는 사람: {draft['to']}\n"
                  f"제목: {draft['subject']}\n본문: {draft['body']}\n[초안 끝]\n")
     if meeting_text:
-        base = parse_date(st.session_state.get("meeting_date_str")) or today_kst()
-        role += f"\n[회의 날짜]\n{fmt_day(base)}\n\n[날짜 참고표] 회의 날짜 기준\n{build_date_guide(base)}\n"
+        if len(meetings) > 1:
+            role += "\n[회의 날짜] 회의록이 여러 개이며 회의록마다 회의 날짜가 다릅니다.\n"
+            for i, m in enumerate(meetings, 1):
+                role += (f"\n- 회의록 {i} ({m['name']}): {fmt_day(m['date'])}\n"
+                         f"[날짜 참고표] 회의록 {i} 기준\n{build_date_guide(m['date'])}\n")
+            role += """
+[여러 회의록 처리 규칙]
+1. 회의록은 '=== 회의록 N: 파일명 (회의 날짜 ...) ===' 줄로 구분됩니다. 답할 때 어느 회의록의 내용인지 밝히세요.
+2. 회의록 속 기한 표현은 그 회의록의 회의 날짜 기준 참고표에서 찾아 쓰세요.
+3. 회의 전체 요약을 요청받으면 회의록마다 따로 요약(정해진 형식)하고 각각 save_summary로 저장하세요. 특정 회의만 말하면 그 회의만 요약하세요.
+4. 같은 업무가 여러 회의록에 나오면 가장 최근 회의 내용을 기준으로 하고, 달라진 점이 있으면 알려 주세요.
+"""
+        else:
+            base = parse_date(st.session_state.get("meeting_date_str")) or today_kst()
+            role += f"\n[회의 날짜]\n{fmt_day(base)}\n\n[날짜 참고표] 회의 날짜 기준\n{build_date_guide(base)}\n"
         role += f"\n[회의 기록 시작]\n{meeting_text}\n[회의 기록 끝]\n"
     else:
         role += "\n아직 회의 기록이 업로드되지 않았습니다. 회의 관련 요청이면 업로드를 안내하세요.\n"
@@ -527,7 +544,7 @@ def ask_able(user_text, history, meeting_text, recipient):
     # 발송/취소 도구는 요청 시작 시점에 초안이 있을 때만 제공 (같은 요청에서 만든 초안을 바로 발송하지 못하게 함)
     available_tools = tools + deadline_tools + summary_tools + (confirm_tools if pending else [])
 
-    for _ in range(5):  # 도구 호출은 최대 5회까지 (요약 저장, 일정 등록 등이 이어질 수 있음)
+    for _ in range(8):  # 도구 호출은 최대 8회까지 (회의록별 요약 저장, 일정 등록 등이 이어질 수 있음)
         instructions = build_instructions(meeting_text, recipient, current_draft(),
                                           st.session_state.deadlines)
         response = client.responses.create(
@@ -910,6 +927,29 @@ QUADRANTS = {
     (False, False): {"order": 4, "icon": "🧹", "title": "긴급하지도 중요하지도 않은 일", "action": "업무 제거 또는 최소화"},
 }
 
+DATE_IN_TEXT = re.compile(r"(20\d{2})\s*[-./년]\s*(\d{1,2})\s*[-./월]\s*(\d{1,2})")
+
+def guess_meeting_date(text):
+    """회의록 앞부분에 적힌 날짜(2026-11-04, 2026.11.04, 2026년 11월 4일)를 찾아 기본값으로 쓴다."""
+    m = DATE_IN_TEXT.search(text[:500])
+    if m:
+        try:
+            return date(int(m[1]), int(m[2]), int(m[3]))
+        except ValueError:
+            pass
+    return None
+
+def extract_tasks_multi(meetings):
+    """회의록마다 그 회의 날짜를 기준으로 업무를 추출해 하나로 합친다 (회의록끼리는 동시에 분석)."""
+    with ThreadPoolExecutor(max_workers=min(4, len(meetings))) as pool:
+        results = list(pool.map(lambda m: extract_tasks(m["text"], m["date"]), meetings))
+    merged = {}
+    # 오래된 회의부터 넣어서, 같은 업무명이면 최근 회의 내용으로 덮어씀
+    for m, items in sorted(zip(meetings, results), key=lambda x: x[0]["date"]):
+        for item in items:
+            merged[item["task"]] = item
+    return list(merged.values())
+
 def extract_tasks(meeting_text, base_date):
     """한 번의 LLM 분석으로 두 탭의 공통 업무와 중요도를 추출한다."""
     instructions = f"""
@@ -1042,10 +1082,13 @@ def queue_request(text):
     st.session_state.chip_request = text
 
 def ask_in_chat(text):
-    """우선순위 탭의 '묻기' 버튼: 요청을 예약하고 대화 탭으로 이동시킨다."""
+    """'묻기' 버튼·자주 쓰는 요청: 요청을 예약하고 대화 탭으로 이동시킨다."""
     queue_request(text)
-    st.session_state.main_tabs = "💬 대화"
-    st.session_state.go_chat = True
+    request_chat_tab()
+
+def request_chat_tab():
+    """다음 화면에서 대화 탭으로 이동하도록 표시한다 (어느 탭에서 요청해도 대화 탭에서 답을 보게)."""
+    st.session_state.chat_navigation = True
 
 def switch_to_chat_tab():
     """탭 상태 제어를 지원하지 않는 구버전 Streamlit의 대화 탭 이동."""
@@ -1055,7 +1098,8 @@ def switch_to_chat_tab():
         "let attempts = 0;"
         "function activateChat() {"
         "const tab = Array.from(window.parent.document.querySelectorAll('button[role=\"tab\"]'))"
-        ".find(el => el.textContent.trim() === '💬 대화');"
+        ".find(el => el.textContent.trim() === '💬 대화' || el.textContent.includes('대화'));"
+        "if (tab && tab.getAttribute('aria-selected') === 'true') return;"
         "if (tab) { tab.click(); return; }"
         "if (++attempts < 50) setTimeout(activateChat, 100);"
         "} activateChat();</script>", height=0)
@@ -1641,8 +1685,9 @@ def render_deadline_tab():
     b1.download_button("📥 캘린더 파일(.ics) 받기", data=make_ics(deadlines),
                        file_name="able_deadlines.ics", mime="text/calendar",
                        use_container_width=True, disabled=not dated)
-    if b2.button("🔄 마감 일정 다시 추출", use_container_width=True):
+    if b2.button("🔄 업무 다시 추출", use_container_width=True):
         st.session_state.deadline_key = None
+        st.session_state.skip_briefing = True
         st.rerun()
     return deadlines
 
@@ -1679,24 +1724,41 @@ for key, value in defaults.items():
 with st.sidebar:
     st.image(ROBOT_URL)
 
-    head_col, title_col = st.columns([1, 5], vertical_alignment="center")
-    with head_col:
-        st.image(ABLE_HEAD, width=42)
-    with title_col:
-        st.markdown("### 회의록")
-    meeting_file = st.file_uploader("회의록(txt) 파일", type=["txt"], label_visibility="collapsed")
-    meeting_text = ""
-    if meeting_file is not None:
-        raw = meeting_file.getvalue()
+    head_b64 = base64.b64encode(ABLE_HEAD).decode()
+    st.markdown(
+        f'<div style="display:flex;align-items:center;gap:4px;">'
+        f'<img src="data:image/png;base64,{head_b64}" width="42">'
+        f'<h3 style="margin:0;padding:0;">회의록</h3></div>',
+        unsafe_allow_html=True,
+    )
+    meeting_files = st.file_uploader("회의록(txt) 파일", type=["txt"], label_visibility="collapsed",
+                                     accept_multiple_files=True)
+    meetings = []   # [{"name", "text", "date"}] 회의록별 내용과 회의 날짜
+    for i, f in enumerate(meeting_files or []):
+        raw = f.getvalue()
         try:
-            meeting_text = raw.decode("utf-8-sig")
+            text = raw.decode("utf-8-sig")
         except UnicodeDecodeError:
-            meeting_text = raw.decode("cp949", errors="ignore")
-        with st.expander(f"{meeting_file.name} 미리보기"):
-            st.text(meeting_text[:1500])
-    meeting_date = st.date_input("📆 회의 날짜", value=today_kst(),
-                                 help="'다음 주 금요일' 같은 기한을 날짜로 바꿀 때 기준이 됩니다.")
+            text = raw.decode("cp949", errors="ignore")
+        with st.expander(f"📄 {f.name}", expanded=len(meeting_files) == 1):
+            d = st.date_input("📆 회의 날짜", value=guess_meeting_date(text) or today_kst(),
+                              key=f"meeting_date_{i}_{f.name}",
+                              help="'다음 주 금요일' 같은 기한을 날짜로 바꿀 때 기준이 됩니다. "
+                                   "회의록에 날짜가 적혀 있으면 자동으로 채워집니다.")
+            st.text(text[:1500])
+        meetings.append({"name": f.name, "text": text, "date": d})
+    meetings.sort(key=lambda m: m["date"])   # 회의 날짜순
+
+    # 기존 코드와 호환: 회의록이 하나면 그대로, 여러 개면 구분선을 넣어 하나로 이어 붙임
+    if len(meetings) == 1:
+        meeting_text = meetings[0]["text"]
+    else:
+        meeting_text = "\n\n".join(
+            f"=== 회의록 {i}: {m['name']} (회의 날짜 {fmt_day(m['date'])}) ===\n{m['text']}"
+            for i, m in enumerate(meetings, 1))
+    meeting_date = meetings[-1]["date"] if meetings else today_kst()   # 가장 최근 회의 날짜
     st.session_state.meeting_date_str = meeting_date.isoformat()
+    st.session_state.meetings = [{"name": m["name"], "date": m["date"]} for m in meetings]
 
     st.subheader("✉️ 기본 수신자")
     recipient = st.text_input("기본 수신자 주소", value=os.getenv("GMAIL_ADDRESS", ""),
@@ -1728,17 +1790,26 @@ with head_left:
 with head_right:
     st.write("")
     badges = []
-    badges.append(f":green-badge[📄 {meeting_file.name}]" if meeting_file else ":orange-badge[📄 회의록 없음]")
+    if len(meetings) == 1:
+        badges.append(f":green-badge[📄 {meetings[0]['name']}]")
+    elif meetings:
+        badges.append(f":green-badge[📄 회의록 {len(meetings)}개]")
+    else:
+        badges.append(":orange-badge[📄 회의록 없음]")
     badges.append(f":blue-badge[✉️ {recipient}]" if recipient else ":orange-badge[✉️ 수신자 없음]")
     st.markdown(" ".join(badges))
 
 # 최신 버전은 공식 상태 제어를 사용하고, 구버전은 아래의 브라우저 이동을 사용한다.
 supports_tab_state = {"key", "on_change"}.issubset(inspect.signature(st.tabs).parameters)
-if st.session_state.pop("chat_navigation", False):
+go_to_chat = st.session_state.pop("chat_navigation", False)
+if go_to_chat and supports_tab_state:
     st.session_state.main_tabs = "💬 대화"
 tab_options = {"key": "main_tabs", "on_change": "rerun"} if supports_tab_state else {}
 tab_chat, tab_pri, tab_rec, tab_cal = st.tabs(
     ["💬 대화", "🎯 우선순위", "🗂️ 회의 기록", "📅 마감 달력"], **tab_options)
+if go_to_chat:
+    # 상태 제어가 안 되는 버전이거나 반영이 늦을 때를 대비해 브라우저에서도 대화 탭을 누른다
+    switch_to_chat_tab()
 
 with tab_chat:
     # 대화창은 전체 너비. 이메일 초안은 대화창 안(맨 아래)에 카드로 들어가 함께 스크롤된다.
@@ -1746,12 +1817,6 @@ with tab_chat:
     draft_area = chat_area
     report_area = st.container()   # 방금 요약한 회의의 PDF 저장 / 미리보기
 
-    # 자주 쓰는 요청: 누르면 해당 문장이 에이블에게 바로 전달된다
-    quick_requests = [("📋", "회의 내용 요약해 줘"), ("🔥", "제일 급한 업무부터 알려줘"),
-                      ("📅", "이번 주 마감 일정 알려줘")]
-    for col, (icon, text) in zip(st.columns(len(quick_requests)), quick_requests):
-        col.button(f"{icon} {text}", key=f"quick_{text}", on_click=queue_request,
-                   args=(text,), use_container_width=True)
 
 # Shared input is outside tab containers, so it stays visible on every tab.
 if "accept_audio" not in inspect.signature(st.chat_input).parameters:
@@ -1759,19 +1824,36 @@ if "accept_audio" not in inspect.signature(st.chat_input).parameters:
     st.stop()
 if "input_draft" in st.session_state:
     st.session_state.unified_input = st.session_state.pop("input_draft")
-submission = st.chat_input(
-    "메시지를 입력하거나 마이크로 녹음하세요. 녹음은 인식 후 확인하여 전송합니다.",
-    key="unified_input", accept_audio=True)
+
+# 화면 아래 고정 영역: 모든 탭에서 보이며, 위에서부터 음성 요청 상태 → 자주 쓰는 요청 → 메시지 입력창 순서
+bottom_area = getattr(st, "bottom", None) or getattr(st, "_bottom", None) or st.container()
+with bottom_area:
+    voice_box = st.container()     # 🎤 음성 요청하기: 안내 / 인식 중 / 오류·다시 시도
+    # 자주 쓰는 요청: 누르면 해당 문장이 에이블에게 바로 전달되고 대화 탭으로 이동
+    quick_requests = [("📋", "회의 내용 요약해 줘"), ("🔥", "제일 급한 업무부터 알려줘"),
+                      ("📅", "이번 주 마감 일정 알려줘")]
+    for col, (icon, text) in zip(st.columns(len(quick_requests)), quick_requests):
+        col.button(f"{icon} {text}", key=f"quick_{text}", on_click=ask_in_chat,
+                   args=(text,), use_container_width=True)
+    submission = st.chat_input(
+        "메시지를 입력하거나 마이크로 녹음하세요. 녹음은 인식 후 확인하여 전송합니다.",
+        key="unified_input", accept_audio=True)
+
+with voice_box:
+    if not st.session_state.voice_audio:
+        st.caption("🎤 음성 요청하기 · 입력창의 마이크를 눌러 말하면, 인식된 내용이 입력창에 채워져요. 확인 후 전송하세요.")
+
 if submission is not None:
     if submission.audio is not None:
         st.session_state.voice_audio = submission.audio.getvalue()
         st.session_state.voice_error = None
         st.session_state.voice_text = None
         st.session_state.voice_prefix = submission.text.strip()
+        request_chat_tab()       # 음성 명령도 바로 대화 탭으로 이동한 뒤 인식
+        st.rerun()
     elif submission.text.strip():
         queue_request(submission.text.strip())
-        st.session_state.go_chat = True
-        st.session_state.chat_navigation = True
+        request_chat_tab()       # 다른 탭에서 보내도 대화 탭으로 이동
         st.session_state.voice_audio = None
         st.session_state.voice_error = None
         st.session_state.voice_text = None
@@ -1780,15 +1862,12 @@ if submission is not None:
 if st.session_state.voice_audio:
     retry_voice = False
     if st.session_state.voice_error:
-        st.warning(f"음성 인식 오류: {st.session_state.voice_error}")
-        retry_voice = st.button("🔄 음성 인식 다시 시도", key="voice_retry")
-    if st.button("❌ 녹음 취소", key="voice_cancel"):
-        st.session_state.voice_audio = None
-        st.session_state.voice_error = None
-        st.rerun()
+        with voice_box:
+            st.warning(f"음성 인식 오류: {st.session_state.voice_error}")
+            retry_voice = st.button("🔄 음성 인식 다시 시도", key="voice_retry")
     if not st.session_state.voice_error or retry_voice:
         try:
-            with st.spinner("음성을 텍스트로 변환하는 중..."):
+            with voice_box, st.spinner("🎤 음성을 텍스트로 변환하는 중..."):
                 recognized = transcribe(st.session_state.voice_audio).strip()
             if not recognized:
                 raise ValueError("인식된 내용이 없습니다. 다시 녹음해 주세요.")
@@ -1811,20 +1890,28 @@ with tab_rec:
 if meeting_text:
     priority_key = hashlib.md5(f"{meeting_text}|{meeting_date}".encode()).hexdigest()
     if st.session_state.priority_key != priority_key or st.session_state.deadline_key is None:
-        with st.spinner("에이블이 업무 우선순위를 정리하는 중..."):
+        # try 밖에서 꺼내야 실패해도 플래그가 남지 않음
+        skip_briefing = st.session_state.pop("skip_briefing", False)
+        with st.spinner("에이블이 업무를 정리하는 중..."):
             try:
                 items = extract_tasks(meeting_text, meeting_date)
                 set_deadlines(items)
                 st.session_state.deadline_changed = False
-                st.session_state.deadline_key = priority_key
-                # 회의록을 새로 올리면 에이블이 먼저 말을 건넴 (챗봇다운 첫인사)
-                add_message(role="assistant", content=briefing_text(st.session_state.priority_items))
+                if not skip_briefing:
+                    add_message(role="assistant", content=briefing_text(st.session_state.priority_items))
             except Exception as e:
-                st.session_state.priority_items = []
-                st.error(f"우선순위 분류 중 오류가 발생했습니다: {e}")
-            else:
-                st.session_state.priority_key = priority_key
+                st.error(f"업무 추출 중 오류가 발생했습니다: {e}")
+                # 다른 회의록으로 바꿨다가 실패한 경우에만 이전 회의록 업무를 비움
+                if st.session_state.priority_key != priority_key:
+                    set_deadlines([])
+                    st.session_state.deadline_changed = False
+        # 성공·실패와 관계없이 기록 → 실패 시 무한 재호출 방지
+        st.session_state.priority_key = priority_key
+        st.session_state.deadline_key = priority_key
 else:
+    if st.session_state.priority_key is not None:   # 회의록을 방금 지운 경우에만 비움
+        set_deadlines([])
+        st.session_state.deadline_changed = False
     st.session_state.priority_key = None
 
 set_deadlines(st.session_state.deadline_items, refresh_editor=False)
@@ -1836,8 +1923,11 @@ with tab_cal:
         st.info("왼쪽에서 회의록(txt)을 업로드하면 마감 일정을 자동으로 찾아 달력에 표시합니다. "
                 "에이블에게 \"다음 주 금요일에 ○○ 마감 표시해줘\"라고 말해도 됩니다.")
     elif meeting_text:
-        deadline_key = hashlib.md5(f"{meeting_text}|{meeting_date}".encode()).hexdigest()
-        st.caption(f"회의 날짜 {meeting_date.isoformat()} 기준으로 상대적인 기한을 계산했습니다.")
+        if len(meetings) > 1:
+            st.caption("회의록 " + ", ".join(f"{m['name']}({m['date'].isoformat()})" for m in meetings)
+                       + " 각각의 회의 날짜 기준으로 상대적인 기한을 계산했습니다.")
+        else:
+            st.caption(f"회의 날짜 {meeting_date.isoformat()} 기준으로 상대적인 기한을 계산했습니다.")
     if meeting_text or st.session_state.deadline_items:
         st.session_state.deadlines = render_deadline_tab()
 
@@ -1859,8 +1949,7 @@ pending_text, pending_src = None, "text"
 chip = st.session_state.pop("chip_request", None)
 if chip:
     pending_text = chip
-    if st.session_state.pop("go_chat", False) and not supports_tab_state:
-        switch_to_chat_tab()     # 답변이 만들어지기 전에 먼저 대화 탭으로 이동
+    st.session_state.pop("go_chat", None)     # 대화 탭 이동은 탭을 만들 때 처리함
 
 # ---------------------------------------------------------------
 # 대화 영역: 기존 대화 출력 + 새 요청 처리
@@ -1869,11 +1958,10 @@ with chat_area:
     old = st.session_state.messages
     if not old and not pending_text:
         with st.chat_message("assistant", avatar=ROBOT_AVATAR):
-            st.markdown("안녕하세요, 김 대리님! 개인비서 **에이블**입니다. 👋")
-            if meeting_file is None:
-                st.warning("먼저 왼쪽에서 회의록(txt)을 업로드해 주세요.")
+            st.markdown("안녕하세요, 김 대리님! 개인비서 **에이블**입니다. 👋\n\n"
+                        "**어떤 업무를 도와드릴까요?**")
             st.markdown("- 아래에서 **음성 녹음** 또는 **채팅**으로 요청하세요.\n"
-                        "- 대화창 아래의 **자주 쓰는 요청** 버튼도 사용할 수 있어요.")
+                        "- 입력창 바로 위의 **자주 쓰는 요청** 버튼도 사용할 수 있어요.")
 
     # 오래된 메시지는 접어서 보여 줌
     if len(old) > RECENT_OPEN:
