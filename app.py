@@ -1476,7 +1476,8 @@ CAL_CSS = (
     "white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}"
     # 우선순위 색: 1 빨강(긴급·중요) · 2 파랑(중요) · 3 주황(긴급) · 4 회색(둘 다 아님)
     ".able-cal .pill{display:flex;align-items:center;justify-content:space-between;gap:4px;white-space:normal;}"
-    ".able-cal .pill .cb{flex:none;width:14px;height:14px;border:1.5px solid rgba(255,255,255,.9);border-radius:3px;"
+    "[class*='st-key-caldone_']{display:none;}"
+    ".able-cal .pill .cb{cursor:pointer;flex:none;width:14px;height:14px;border:1.5px solid rgba(255,255,255,.9);border-radius:3px;"
     "font-size:11px;line-height:12px;text-align:center;}"
     ".able-cal .etc .cb{border-color:rgba(128,128,128,.8);}"
     ".able-cal .pill.done{opacity:.55;}.able-cal .pill.done .t{text-decoration:line-through;}"
@@ -1574,7 +1575,7 @@ def month_grid_html(year, month, dated, today, max_items=3, priority_items=None)
                 f"<div class='pill {cls}{' done' if d.get('done') else ''}' "
                 f"title='{escape(label)} · {escape(d['task'])}'>"
                 f"<span class='t'>{icon}{escape(d['task'])}</span>"
-                f"<span class='cb'>{'✓' if d.get('done') else ''}</span></div>"
+                f"<span class='cb' data-id='{d['id']}'>{'✓' if d.get('done') else ''}</span></div>"
                 for d, cls, icon, label in items[:max_items])
             more = f"<div class='more'>+{len(items) - max_items}건 더</div>" if len(items) > max_items else ""
             cells.append(f"<td class='{cls.strip()}'><div class='num'>{day.day}</div>{pills}{more}</td>")
@@ -1734,6 +1735,17 @@ def render_deadline_tab():
                                         priority_items=st.session_state.get("priority_items", [])),
                         unsafe_allow_html=True)
             st.markdown(CAL_CSS + priority_legend_html(), unsafe_allow_html=True)
+            # 달력 체크박스 클릭 → 숨겨진 버튼을 눌러 완료 상태를 바꿈 (표의 '완료' 열과 동기화)
+            for d in dated:
+                st.button("완료", key=f"caldone_{d['id']}", on_click=toggle_done, args=(d["id"],))
+            components.html(
+                "<script>const p = window.parent;"
+                "if (!p.__ableCb) { p.__ableCb = true;"
+                "p.document.addEventListener('click', function(e) {"
+                "const cb = e.target.closest ? e.target.closest('.able-cal .cb') : null;"
+                "if (!cb) return;"
+                "const btn = p.document.querySelector('.st-key-caldone_' + cb.dataset.id + ' button');"
+                "if (btn) btn.click(); }); }</script>", height=0)
 
     if undated:
         with undated_area:
