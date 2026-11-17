@@ -40,7 +40,9 @@ CSS = """
   --p400:#9f67ff; --p300:#c4b0ff; --p200:#e2d8ff; --p100:#f3eeff; --p50:#faf8ff;
   --ink:#1f1530; --muted:#6b6385; --line:#ece6fb;
 }
-html, body, [class*="st-"], button, input, textarea {font-family:'Pretendard',system-ui,sans-serif;}
+html, body, .stApp, .stApp p, .stApp li, .stApp label, .stApp button, .stApp input, .stApp textarea {font-family:'Pretendard',system-ui,sans-serif;}
+/* 머티리얼 아이콘은 글꼴을 되돌려야 'keyboard_double_arrow' 같은 글자로 깨지지 않는다 */
+[data-testid="stIconMaterial"], .material-symbols-rounded {font-family:'Material Symbols Rounded','Material Icons' !important;}
 [data-testid="stApp"]{
   color:var(--ink);
   background:
@@ -79,8 +81,14 @@ html, body, [class*="st-"], button, input, textarea {font-family:'Pretendard',sy
   color:var(--ink);font-weight:500;font-size:13.5px;padding:.5rem .7rem;}
 [class*="st-key-hist_"] button:hover{background:rgba(255,255,255,.75);color:var(--ink);}
 [class*="st-key-hist_"] button[kind="primary"]{background:#fff;color:var(--p700);font-weight:600;box-shadow:0 2px 8px rgba(109,40,217,.08);}
-[class*="st-key-del_"] button{border:none;background:transparent;color:var(--muted);padding:.4rem;min-height:0;}
-[class*="st-key-del_"] button:hover{background:var(--p100);color:var(--p700);}
+/* ⋯ 메뉴: 항목에 마우스를 올렸을 때만 보인다 (ChatGPT 방식) */
+[class*="st-key-menu_"]{opacity:0;transition:.15s;}
+[data-testid="stHorizontalBlock"]:hover [class*="st-key-menu_"],
+[class*="st-key-menu_"]:focus-within{opacity:1;}
+[class*="st-key-menu_"] button{border:none;background:transparent;color:var(--muted);padding:.3rem .2rem;min-height:0;}
+[class*="st-key-menu_"] button:hover{background:var(--p100);color:var(--p700);}
+[class*="st-key-menu_"] button [data-testid="stIconMaterial"]{display:none;}   /* 펼침 화살표 숨김 */
+.logo{height:26px;margin:2px 0 14px 4px;display:block;}
 
 /* 인사말 */
 .greet{text-align:center;margin:8vh 0 28px;}
@@ -330,6 +338,14 @@ def delete_chat(chat_id):
         st.session_state.current = st.session_state.chats[0]["id"]
 
 
+def rename_chat(chat_id):
+    new_title = st.session_state.get("ren_" + chat_id, "").strip()
+    if new_title:
+        for c in st.session_state.chats:
+            if c["id"] == chat_id:
+                c["title"] = new_title[:30]
+
+
 def clear_all():
     chat = new_chat_obj()
     st.session_state.chats = [chat]
@@ -344,6 +360,10 @@ def ask(question):
 # 사이드바: 새 대화 / 대화 기록 / 등록 문서 / 전체 삭제
 # ---------------------------------------------------------------
 with st.sidebar:
+    st.markdown(
+        '<img class="logo" src="https://raw.githubusercontent.com/Jangrae/img/master/aivle.png" alt="AIVLE">',
+        unsafe_allow_html=True,
+    )
     st.button("＋ 새 대화", key="new_chat", on_click=start_new_chat)
 
     st.markdown('<div class="side-label">대화 기록</div>', unsafe_allow_html=True)
@@ -356,7 +376,11 @@ with st.sidebar:
             c["title"], key="hist_" + c["id"], on_click=select_chat, args=(c["id"],),
             type="primary" if c["id"] == st.session_state.current else "secondary",
         )
-        col_x.button("✕", key="del_" + c["id"], on_click=delete_chat, args=(c["id"],))
+        with col_x.container(key="menu_" + c["id"]):
+            with st.popover("⋯"):
+                st.text_input("대화 이름", value=c["title"], key="ren_" + c["id"], max_chars=30)
+                st.button("이름 변경", key="save_" + c["id"], on_click=rename_chat, args=(c["id"],), use_container_width=True)
+                st.button("삭제", key="rm_" + c["id"], on_click=delete_chat, args=(c["id"],), use_container_width=True)
 
     st.markdown('<div class="side-label">등록된 문서</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="doc-chip"><b>기본</b><span>{BASE_NAME}</span></div>', unsafe_allow_html=True)
